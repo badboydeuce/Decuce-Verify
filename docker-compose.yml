@@ -1,31 +1,37 @@
-# Docker compose
-FROM python:3.11-slim
+version: '3.8'
 
-WORKDIR /app
+services:
+  app:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      - DATABASE_URL=postgresql://deuceverify:password@postgres:5432/deuceverify
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - postgres
+      - redis
+    env_file:
+      - .env
+    restart: unless-stopped
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    libpq-dev \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: deuceverify
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: deuceverify
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
 
-# Copy requirements first (better caching)
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
 
-# Copy application
-COPY . .
-
-# Create logs directory
-RUN mkdir -p logs
-
-# Expose Flask port
-EXPOSE 5000
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:5000/health || exit 1
-
-# Start both services using a process manager
-CMD python api/app.py & python -m bot.main
+volumes:
+  postgres_data:
