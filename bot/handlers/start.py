@@ -1,59 +1,75 @@
-# /start handler
 from aiogram import Router, F
-from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from models.database import User
-from datetime import datetime
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from database.crud import get_or_create_user
+from bot.keyboards.main_menu import get_main_menu_keyboard
+from bot.keyboards.inline_keyboards import get_back_keyboard
 
 router = Router()
 
-def main_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📱 Buy Number", callback_data="menu_buy"),
-         InlineKeyboardButton(text="💰 Wallet", callback_data="menu_wallet")],
-        [InlineKeyboardButton(text="📋 My Orders", callback_data="menu_orders"),
-         InlineKeyboardButton(text="👤 Profile", callback_data="menu_profile")],
-        [InlineKeyboardButton(text="❓ Support", callback_data="menu_support")]
-    ])
-
 @router.message(CommandStart())
-async def cmd_start(message: Message, db_manager):
-    session = db_manager.get_session()
-    try:
-        user = session.query(User).filter_by(telegram_id=message.from_user.id).first()
-        if not user:
-            user = User(
-                telegram_id=message.from_user.id,
-                username=message.from_user.username,
-                first_name=message.from_user.first_name,
-                created_at=datetime.utcnow()
-            )
-            session.add(user)
-            session.commit()
-            await message.answer("🎉 Welcome to DeuceVerify!\n\nYour virtual number SMS verification platform.\n\nUse the menu below to get started.", reply_markup=main_menu())
-        else:
-            await message.answer(f"👋 Welcome back, {user.first_name}!\n\n💰 Balance: ${user.balance:.2f}\n\nWhat would you like to do?", reply_markup=main_menu())
-    finally:
-        session.close()
+async def cmd_start(message: Message, state: FSMContext):
+    """Handle /start command"""
+    await state.clear()
+    
+    # Get or create user
+    user = await get_or_create_user(
+        telegram_id=message.from_user.id,
+        username=message.from_user.username
+    )
+    
+    welcome_text = (
+        f"🚀 <b>Welcome to DeuceVerify!</b>\n\n"
+        f"Your trusted platform for instant virtual numbers and SMS verification.\n\n"
+        f"<b>✨ What we offer:</b>\n"
+        f"• 📱 <b>One-time SMS Codes</b> - For Telegram, WhatsApp, Gmail & 100+ services\n"
+        f"• 🔄 <b>Number Rental</b> - Rent numbers for hours/days/weeks\n"
+        f"• ⚡ <b>Instant Delivery</b> - Get codes in seconds\n"
+        f"• 💰 <b>Pay with Naira</b> - via Paystack\n\n"
+        f"<b>💰 Your Balance:</b> <code>₦{user.balance:,.2f}</code>\n\n"
+        f"Use the menu below to get started!"
+    )
+    
+    await message.answer(
+        welcome_text,
+        reply_markup=get_main_menu_keyboard()
+    )
 
-@router.callback_query(F.data == "menu_profile")
-async def menu_profile(callback: CallbackQuery, db_manager):
-    session = db_manager.get_session()
-    try:
-        user = session.query(User).filter_by(telegram_id=callback.from_user.id).first()
-        await callback.message.edit_text(
-            f"👤 <b>Your Profile</b>\n\n"
-            f"Name: {user.first_name}\n"
-            f"Balance: <b>${user.balance:.2f}</b>\n"
-            f"Total orders: {user.total_orders}\n"
-            f"Total spent: ${user.total_spent:.2f}",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Back", callback_data="back_to_menu")]
-            ])
-        )
-    finally:
-        session.close()
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    """Handle /help command"""
+    help_text = (
+        "📚 <b>How to Use DeuceVerify</b>\n\n"
+        "<b>📱 One-Time SMS Codes:</b>\n"
+        "1️⃣ Click 'Buy Number'\n"
+        "2️⃣ Select 'One-Time SMS'\n"
+        "3️⃣ Choose country & service\n"
+        "4️⃣ Pay and receive number\n"
+        "5️⃣ Wait for SMS code\n\n"
+        "<b>🔄 Number Rental:</b>\n"
+        "1️⃣ Click 'Buy Number'\n"
+        "2️⃣ Select 'Rent Number'\n"
+        "3️⃣ Choose duration (hour/day/week/month)\n"
+        "4️⃣ Receive number for multiple SMS\n\n"
+        "<b>💳 Payments:</b>\n"
+        "• Minimum funding: ₦1,500\n"
+        "• Instant wallet topup via Paystack\n"
+        "• 1.5% service fee applies\n\n"
+        "<b>⏱️ Timeouts:</b>\n"
+        "• One-time SMS: 20 minutes\n"
+        "• Rental: According to selected duration\n\n"
+        "<b>❓ Need help?</b>\n"
+        "Contact @DeuceVerifySupport"
+    )
+    await message.answer(help_text, reply_markup=get_back_keyboard())
 
-@router.callback_query(F.data == "back_to_menu")
-async def back_to_menu(callback: CallbackQuery):
-    await callback.message.edit_text("Main Menu:", reply_markup=main_menu())
+@router.callback_query(F.data == "back_to_main")
+async def back_to_main(callback: CallbackQuery, state: FSMContext):
+    """Return to main menu"""
+    await state.clear()
+    await callback.message.edit_text(
+        "🏠 <b>Main Menu</b>\n\nChoose an option:",
+        reply_markup=get_main_menu_keyboard()
+    )
+    await callback.answer()
