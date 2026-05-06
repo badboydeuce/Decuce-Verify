@@ -1,37 +1,27 @@
 version: '3.8'
 
 services:
-  app:
-    build: .
-    ports:
-      - "5000:5000"
-    environment:
-      - DATABASE_URL=postgresql://deuceverify:password@postgres:5432/deuceverify
-      - REDIS_URL=redis://redis:6379/0
-    depends_on:
-      - postgres
-      - redis
-    env_file:
-      - .env
-    restart: unless-stopped
-
-  postgres:
-    image: postgres:15-alpine
+  db:
+    image: postgres:15
     environment:
       POSTGRES_USER: deuceverify
-      POSTGRES_PASSWORD: password
+      POSTGRES_PASSWORD: deuceverify123
       POSTGRES_DB: deuceverify
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
-    restart: unless-stopped
 
-  redis:
-    image: redis:7-alpine
+  api:
+    build: .
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgresql://deuceverify:deuceverify123@db:5432/deuceverify
     ports:
-      - "6379:6379"
-    restart: unless-stopped
+      - "5000:5000"
+    env_file:
+      - .env
 
 volumes:
   postgres_data:
