@@ -978,9 +978,8 @@ def rate_limit_error(error):
 
 # ==================== RUN APP ====================
 
+# At the end of api/app.py, make sure you have:
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5000))
-    debug = os.getenv('DEBUG', 'False').lower() == 'true'
-    
-    logger.info(f"Starting DeuceVerify API on port {port} (debug={debug})")
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    # Must bind to 0.0.0.0 for Railway
+    app.run(host='0.0.0.0', port=port, debug=False)
