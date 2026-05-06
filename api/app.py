@@ -3,10 +3,16 @@ DeuceVerify Flask API
 Handles payment webhooks, user management, and order processing
 """
 
+
+import sys
+import os
+
+# Add the project root to Python path so 'models' can be found
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
-import os
 import hmac
 import hashlib
 import json
@@ -16,6 +22,8 @@ from loguru import logger
 
 # Load environment variables
 load_dotenv()
+
+# Rest of your app code...
 
 # ==================== CREATE FLASK APP ====================
 
