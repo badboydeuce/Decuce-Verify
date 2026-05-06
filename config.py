@@ -1,75 +1,117 @@
 import os
-from typing import List
+from typing import List, Optional
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-# Try to use pydantic-settings if available, otherwise fallback to os.getenv
-try:
-    from pydantic_settings import BaseSettings
+class Config:
+    """Simple configuration without pydantic"""
     
-    class Settings(BaseSettings):
-        # Bot
-        bot_token: str
-        admin_ids: List[int]
+    def __init__(self):
+        # Bot Configuration
+        self.BOT_TOKEN = os.getenv("BOT_TOKEN")
+        
+        # Parse ADMIN_IDS - handles both single ID and comma-separated
+        admin_ids_str = os.getenv("ADMIN_IDS", "")
+        self.ADMIN_IDS = []
+        if admin_ids_str:
+            # Split by comma and convert to int
+            for id_str in admin_ids_str.split(","):
+                id_str = id_str.strip()
+                if id_str and id_str.isdigit():
+                    self.ADMIN_IDS.append(int(id_str))
         
         # Database
-        database_url: str
+        self.DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/deuceverify")
         
-        # SMS-Man
-        sms_man_token: str
-        sms_man_base_url: str = "https://api.sms-man.com/control"
+        # SMS-Man API
+        self.SMS_MAN_TOKEN = os.getenv("SMS_MAN_TOKEN")
+        self.SMS_MAN_BASE_URL = os.getenv("SMS_MAN_BASE_URL", "https://api.sms-man.com/control")
+        self.SMS_MAN_RENT_BASE_URL = "https://api.sms-man.com/rent-api"
         
         # Paystack
-        paystack_secret_key: str
-        paystack_public_key: str
-        paystack_callback_url: str
+        self.PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
+        self.PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
+        self.PAYSTACK_CALLBACK_URL = os.getenv("PAYSTACK_CALLBACK_URL")
         
         # Flask
-        flask_secret_key: str
-        flask_port: int = 5000
+        self.FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "default-dev-key-change-in-production")
+        self.FLASK_PORT = int(os.getenv("FLASK_PORT", "5000"))
         
-        # App
-        profit_margin: float = 1.5
-        minimum_funding_ngn: int = 1500
-        activation_timeout_seconds: int = 1200
-        rental_timeout_hours: int = 24
-        
-        class Config:
-            env_file = ".env"
-            env_file_encoding = "utf-8"
+        # App Settings
+        self.PROFIT_MARGIN = float(os.getenv("PROFIT_MARGIN", "1.5"))
+        self.MINIMUM_FUNDING_NGN = int(os.getenv("MINIMUM_FUNDING_NGN", "1500"))
+        self.ACTIVATION_TIMEOUT_SECONDS = int(os.getenv("ACTIVATION_TIMEOUT_SECONDS", "1200"))
+        self.RENTAL_TIMEOUT_HOURS = int(os.getenv("RENTAL_TIMEOUT_HOURS", "24"))
     
-    settings = Settings()
+    # Properties for backward compatibility (code that expects lowercase attributes)
+    @property
+    def bot_token(self) -> Optional[str]:
+        return self.BOT_TOKEN
     
-except ImportError:
-    # Fallback to simple config without pydantic-settings
-    class Settings:
-        def __init__(self):
-            # Bot
-            self.bot_token = os.getenv("BOT_TOKEN")
-            self.admin_ids = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-            
-            # Database
-            self.database_url = os.getenv("DATABASE_URL")
-            
-            # SMS-Man
-            self.sms_man_token = os.getenv("SMS_MAN_TOKEN")
-            self.sms_man_base_url = os.getenv("SMS_MAN_BASE_URL", "https://api.sms-man.com/control")
-            
-            # Paystack
-            self.paystack_secret_key = os.getenv("PAYSTACK_SECRET_KEY")
-            self.paystack_public_key = os.getenv("PAYSTACK_PUBLIC_KEY")
-            self.paystack_callback_url = os.getenv("PAYSTACK_CALLBACK_URL")
-            
-            # Flask
-            self.flask_secret_key = os.getenv("FLASK_SECRET_KEY")
-            self.flask_port = int(os.getenv("FLASK_PORT", "5000"))
-            
-            # App
-            self.profit_margin = float(os.getenv("PROFIT_MARGIN", "1.5"))
-            self.minimum_funding_ngn = int(os.getenv("MINIMUM_FUNDING_NGN", "1500"))
-            self.activation_timeout_seconds = int(os.getenv("ACTIVATION_TIMEOUT_SECONDS", "1200"))
-            self.rental_timeout_hours = int(os.getenv("RENTAL_TIMEOUT_HOURS", "24"))
+    @property
+    def admin_ids(self) -> List[int]:
+        return self.ADMIN_IDS
     
-    settings = Settings()
+    @property
+    def database_url(self) -> str:
+        return self.DATABASE_URL
+    
+    @property
+    def sms_man_token(self) -> Optional[str]:
+        return self.SMS_MAN_TOKEN
+    
+    @property
+    def sms_man_base_url(self) -> str:
+        return self.SMS_MAN_BASE_URL
+    
+    @property
+    def paystack_secret_key(self) -> Optional[str]:
+        return self.PAYSTACK_SECRET_KEY
+    
+    @property
+    def paystack_public_key(self) -> Optional[str]:
+        return self.PAYSTACK_PUBLIC_KEY
+    
+    @property
+    def paystack_callback_url(self) -> Optional[str]:
+        return self.PAYSTACK_CALLBACK_URL
+    
+    @property
+    def flask_secret_key(self) -> str:
+        return self.FLASK_SECRET_KEY
+    
+    @property
+    def flask_port(self) -> int:
+        return self.FLASK_PORT
+    
+    @property
+    def profit_margin(self) -> float:
+        return self.PROFIT_MARGIN
+    
+    @property
+    def minimum_funding_ngn(self) -> int:
+        return self.MINIMUM_FUNDING_NGN
+    
+    @property
+    def activation_timeout_seconds(self) -> int:
+        return self.ACTIVATION_TIMEOUT_SECONDS
+    
+    @property
+    def rental_timeout_hours(self) -> int:
+        return self.RENTAL_TIMEOUT_HOURS
+
+# Create singleton instance
+settings = Config()
+
+# Validation
+if not settings.BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN is required in .env file")
+
+print(f"✅ Configuration loaded successfully!")
+print(f"   Bot Token: {settings.BOT_TOKEN[:20]}...")
+print(f"   Admin IDs: {settings.ADMIN_IDS}")
+print(f"   Database: {settings.DATABASE_URL[:50]}...")
+print(f"   Flask Port: {settings.FLASK_PORT}")
+print(f"   Profit Margin: {settings.PROFIT_MARGIN}%")
