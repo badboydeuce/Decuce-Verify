@@ -109,6 +109,64 @@ async def admin_dashboard(callback: CallbackQuery, db_manager):
     finally:
         session.close()
 
+# Add this to admin.py for profit tracking
+
+@router.callback_query(F.data == "admin_profit_analytics")
+async def admin_profit_analytics(callback: CallbackQuery, db_manager):
+    """Show profit analytics"""
+    session = db_manager.get_session()
+    
+    try:
+        from models.database import Order, Transaction
+        from sqlalchemy import func
+        
+        # Calculate total profit
+        orders = session.query(Order).filter(Order.status.in_(['received', 'active'])).all()
+        total_revenue = sum(o.cost for o in orders)
+        total_cost = sum(getattr(o, 'original_cost', o.cost / 2) for o in orders)
+        total_profit = total_revenue - total_cost
+        avg_profit_percent = (total_profit / total_cost * 100) if total_cost > 0 else 0
+        
+        # Profit by service
+        profit_by_service = session.query(
+            Order.service_name,
+            func.sum(Order.cost).label('revenue'),
+            func.sum(getattr(Order, 'original_cost', Order.cost / 2)).label('cost')
+        ).group_by(Order.service_name).limit(10).all()
+        
+        text = (
+            "💰 <b>Profit Analytics</b>\n\n"
+            f"📊 <b>Overview</b>\n"
+            f"├─ Total Orders: {len(orders)}\n"
+            f"├─ Total Revenue: ${total_revenue:.2f}\n"
+            f"├─ Total Cost: ${total_cost:.2f}\n"
+            f"└─ <b>Total Profit: ${total_profit:.2f}</b>\n\n"
+            f"📈 <b>Margin</b>\n"
+            f"├─ Average Profit %: {avg_profit_percent:.1f}%\n"
+            f"└─ Markup Multiplier: {sms_client.profit_margin}x\n\n"
+            f"🏆 <b>Top Services by Profit</b>\n"
+        )
+        
+        for service in profit_by_service[:5]:
+            revenue = service[1] or 0
+            cost = service[2] or 0
+            profit = revenue - cost
+            text += f"├─ {service[0]}: +${profit:.2f}\n"
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Export Profit Report", callback_data="admin_export_profit")],
+            [InlineKeyboardButton(text="⚙️ Adjust Markup", callback_data="admin_adjust_markup")],
+            [InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")]
+        ])
+        
+        await callback.message.edit_text(text, reply_markup=keyboard)
+        
+    except Exception as e:
+        logger.error(f"Profit analytics error: {e}")
+        await callback.message.edit_text("❌ Error loading profit data")
+    finally:
+        session.close()
+
 # ==================== USER MANAGEMENT ====================
 
 @router.callback_query(F.data == "admin_users")
