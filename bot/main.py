@@ -1,42 +1,41 @@
-# Bot entry point
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher
+from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from dotenv import load_dotenv
-import os
+from config import settings
+from bot.handlers import start, wallet, activation, rental, orders, admin
+from database.db import init_db
 
-load_dotenv()
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-from bot.handlers import start, wallet, number, orders, services, admin
-from bot.utils.smsman_client import SMSManClient
-from models.database import DatabaseManager
-
-# Initialize
-bot = Bot(token=os.getenv('BOT_TOKEN'))
-dp = Dispatcher(storage=MemoryStorage())
-db_manager = DatabaseManager(os.getenv('DATABASE_URL'))
-sms_client = SMSManClient(token=os.getenv('SMS_MAN_TOKEN'))
-
-# Create tables
-db_manager.create_tables()
-
-# Register handlers
-dp.include_router(start.router)
-dp.include_router(wallet.router)
-dp.include_router(number.router)
-dp.include_router(orders.router)
+# Initialize bot and dispatcher
+bot = Bot(token=settings.bot_token, parse_mode=ParseMode.HTML)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
 async def main():
-    await bot.set_my_commands([
-        ("start", "Start bot"),
-        ("balance", "Check balance"),
-        ("orders", "My orders")
-    ])
+    """Main bot entry point"""
+    # Initialize database
+    init_db()
+    logger.info("Database initialized")
     
-    print("🚀 Bot started!")
-    await dp.start_polling(bot, sms_client=sms_client, db_manager=db_manager)
+    # Register routers
+    dp.include_router(start.router)
+    dp.include_router(wallet.router)
+    dp.include_router(activation.router)
+    dp.include_router(rental.router)
+    dp.include_router(orders.router)
+    dp.include_router(admin.router)
+    
+    # Start polling
+    logger.info("Starting bot...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
