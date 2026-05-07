@@ -50,11 +50,13 @@ with app.app_context():
     except Exception as e:
         logger.error(f"❌ Database initialization failed: {e}")
 
-# ============ HEALTH CHECK ENDPOINTS ============
+# ============ HEALTH CHECK ENDPOINTS (CRITICAL FOR RAILWAY) ============
 
+@app.route('/health', methods=['GET'])
 @app.route('/api/health', methods=['GET'])
+@app.route('/healthcheck', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
+    """Health check endpoint for Railway - responds quickly"""
     return jsonify({
         "status": "healthy",
         "service": "DeuceVerify API",
@@ -63,9 +65,26 @@ def health_check():
         "database": "connected"
     }), 200
 
+@app.route('/health/live', methods=['GET'])
+def liveness_check():
+    """Liveness probe - always returns 200 if app is running"""
+    return "OK", 200
+
+@app.route('/health/ready', methods=['GET'])
+def readiness_check():
+    """Readiness probe - checks if database is accessible"""
+    try:
+        db = SessionLocal()
+        db.execute("SELECT 1")
+        db.close()
+        return "READY", 200
+    except Exception as e:
+        logger.error(f"Readiness check failed: {e}")
+        return "NOT READY", 503
+
 @app.route('/api/health/db', methods=['GET'])
 def db_health_check():
-    """Database health check"""
+    """Detailed database health check"""
     try:
         db = SessionLocal()
         from database.models import User
@@ -230,7 +249,39 @@ def fund_wallet():
     finally:
         db.close()
 
-# ============ ORDER ENDPOINTS ============
+@app.route('/api/wallet/transactions', methods=['GET'])
+def get_transactions():
+    """Get user's transaction history"""
+    telegram_id = request.args.get('telegram_id')
+    limit = request.args.get('limit', 50, type=int)
+    
+    if not telegram_id:
+        return jsonify({"error": "telegram_id required"}), 400
+    
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, int(telegram_id))
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        
+        transactions = get_user_transactions(db, user.id, limit)
+        
+        return jsonify({
+            "transactions": [
+                {
+                    "id": tx.id,
+                    "amount": tx.amount,
+                    "type": tx.type.value,
+                    "description": tx.description,
+                    "created_at": tx.created_at.isoformat()
+                }
+                for tx in transactions
+            ]
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
 
 @app.route('/api/orders', methods=['GET'])
 def get_orders():
@@ -277,12 +328,13 @@ if __name__ == "__main__":
     print("=" * 50)
     print(f"Port: {settings.flask_port}")
     print(f"Database: {'✅' if settings.database_url else '❌'}")
-    print("=" * 50)
-    print("⚠️  Bot runs separately (run_bot.py)")
+    print(f"Healthcheck: /health, /health/live, /health/ready")
     print("=" * 50)
     
+    # Run on all interfaces, port from env
+    port = int(os.environ.get('PORT', settings.flask_port))
     app.run(
         host="0.0.0.0",
-        port=settings.flask_port,
+        port=port,
         debug=False
     )
