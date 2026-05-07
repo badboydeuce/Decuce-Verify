@@ -9,9 +9,9 @@ import logging
 import os
 import sys
 from datetime import datetime
-from threading import Thread
-import asyncio
+import multiprocessing
 import requests
+import json
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,14 +24,12 @@ from database.crud import (
     create_transaction,
     create_payment_transaction,
     update_payment_transaction,
-    get_user_by_id,
     get_or_create_user,
     get_user_orders,
     get_order,
     update_order_otp
 )
 from api.services.paystack import paystack
-from api.services.sms_man import sms_man
 
 # Configure logging
 logging.basicConfig(
@@ -66,7 +64,8 @@ def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "bot_token_configured": bool(settings.bot_token),
         "sms_man_configured": bool(settings.sms_man_token),
-        "paystack_configured": bool(settings.paystack_secret_key)
+        "paystack_configured": bool(settings.paystack_secret_key),
+        "database_configured": bool(settings.database_url)
     }), 200
 
 @app.route('/api/health/db', methods=['GET'])
@@ -94,99 +93,116 @@ def db_health_check():
 @app.route('/api/webhook/paystack', methods=['POST'])
 def paystack_webhook():
     """
-    Handle Paystack webhook events with proper transaction management.
+    Handle Paystack webhook events
+    Expected events: charge.success, transfer.success, etc.
     """
     payload = request.get_data()
     signature = request.headers.get('x-paystack-signature')
     
-    logger.info("Received Paystack webhook")
-
+    logger.info(f"Received webhook from Paystack")
+    
     # Validate signature
     if not signature:
-        logger.error("Webhook received without signature")
+        logger.error("No signature provided in webhook")
         return jsonify({"error": "No signature provided"}), 400
-
-    # Verify webhook
+    
+    # Verify and process webhook
     event_data = paystack.handle_webhook(payload, signature)
     if not event_data:
-        logger.error("Invalid Paystack webhook signature")
+        logger.error("Invalid webhook signature")
         return jsonify({"error": "Invalid signature"}), 401
-
-    event = event_data.get('event')
-    logger.info(f"Processing webhook event: {event}")
-
-    # Only process charge.success for now (you can extend later)
-    if event != 'charge.success':
-        logger.info(f"Unhandled event type: {event}")
-        return jsonify({"status": "ignored", "event": event}), 200
-
-    # Extract payment details
-    data = event_data.get('data', {})
-    reference = data.get('reference')
-    amount_kobo = data.get('amount', 0)
-    amount = amount_kobo / 100  # Convert to Naira
-    metadata = data.get('metadata', {})
-    telegram_id = metadata.get('telegram_id')
-    user_id = metadata.get('user_id')  # fallback if needed
-
-    logger.info(f"Successful charge - Ref: {reference}, Amount: ₦{amount}, TG_ID: {telegram_id}")
-
-    if not telegram_id:
-        logger.error("Missing telegram_id in payment metadata")
-        return jsonify({"error": "Missing telegram_id in metadata"}), 400
-
-    db = SessionLocal()
-    try:
-        # Start transaction
-        db.begin()
-
-        # Get user
-        user = get_user_by_telegram_id(db, telegram_id)
-        if not user:
-            logger.error(f"User not found for telegram_id: {telegram_id}")
+    
+    # Process successful charge
+    if event_data.get("status") == "success":
+        reference = event_data.get("reference")
+        amount = event_data.get("amount", 0) / 100  # Convert from kobo to NGN
+        metadata = event_data.get("metadata", {})
+        telegram_id = metadata.get("telegram_id")
+        user_id = metadata.get("user_id")
+        
+        logger.info(f"Processing successful payment: reference={reference}, amount=₦{amount}, telegram_id={telegram_id}")
+        
+        if not telegram_id:
+            logger.error("No telegram_id in webhook metadata")
+            return jsonify({"error": "Missing telegram_id"}), 400
+        
+        db = SessionLocal()
+        try:
+            # Get user
+            user = get_user_by_telegram_id(db, telegram_id)
+            if not user:
+                logger.error(f"User not found: telegram_id={telegram_id}")
+                return jsonify({"error": "User not found"}), 404
+            
+            # Check if already processed (idempotency)
+            from database.models import Transaction
+            existing_tx = db.query(Transaction).filter(Transaction.reference == reference).first()
+            if existing_tx:
+                logger.info(f"Transaction {reference} already processed")
+                return jsonify({"status": "already_processed"}), 200
+            
+            # Update user balance
+            user = update_user_balance(db, user.id, amount, "credit")
+            
+            # Create transaction record
+            transaction = create_transaction(
+                db=db,
+                user_id=user.id,
+                amount=amount,
+                transaction_type="credit",
+                reference=reference,
+                description=f"Wallet funding via Paystack",
+                status="completed"
+            )
+            
+            # Update payment transaction if exists
+            payment_tx = update_payment_transaction(db, reference, "completed", event_data)
+            
+            logger.info(f"✅ Successfully credited ₦{amount} to user {telegram_id}. New balance: ₦{user.balance}")
+            
+            # Try to notify user via bot (async but we'll do best effort)
+            try:
+                import threading
+                import asyncio
+                
+                def notify_user():
+                    try:
+                        from bot.main import bot
+                        loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(
+                            bot.send_message(
+                                telegram_id,
+                                f"💰 <b>Payment Successful!</b>\n\n"
+                                f"Your wallet has been credited with {format_amount(amount)}.\n\n"
+                                f"<b>New Balance:</b> {format_amount(user.balance)}\n\n"
+                                f"Thank you for funding your wallet!",
+                                parse_mode="HTML"
+                            )
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send notification: {e}")
+                
+                threading.Thread(target=notify_user, daemon=True).start()
+            except Exception as e:
+                logger.error(f"Error sending notification: {e}")
+            
+            return jsonify({
+                "status": "success",
+                "message": "Payment processed successfully",
+                "user_balance": user.balance
+            }), 200
+            
+        except Exception as e:
+            logger.error(f"Error processing webhook: {e}")
             db.rollback()
-            return jsonify({"error": "User not found"}), 404
-
-        # Update balance
-        user = update_user_balance(db, user.id, amount, "credit")
-
-        # Create transaction record
-        create_transaction(
-            db=db,
-            user_id=user.id,
-            amount=amount,
-            transaction_type="credit",
-            reference=reference,
-            description="Wallet funding via Paystack",
-            status="completed"
-        )
-
-        # Update payment transaction record
-        update_payment_transaction(db, reference, "completed", data)
-
-        # Commit all changes at once
-        db.commit()
-
-        logger.info(f"✅ Payment processed successfully | User {telegram_id} credited ₦{amount} | New balance: ₦{user.balance}")
-
-        return jsonify({
-            "status": "success",
-            "message": "Payment processed successfully",
-            "reference": reference,
-            "amount": amount,
-            "new_balance": float(user.balance)
-        }), 200
-
-    except Exception as e:
-        db.rollback()
-        logger.error(f"❌ Webhook processing failed for reference {reference}: {e}", exc_info=True)
-        return jsonify({
-            "error": "Failed to process payment",
-            "message": str(e)
-        }), 500
-
-    finally:
-        db.close()
+            return jsonify({"error": str(e)}), 500
+        finally:
+            db.close()
+    
+    # Handle other event types
+    logger.info(f"Unhandled webhook event: {event_data.get('event')}")
+    return jsonify({"status": "ignored"}), 200
 
 # ============ WALLET ENDPOINTS ============
 
@@ -214,6 +230,9 @@ def get_balance():
             "balance": user.balance,
             "currency": "NGN"
         }), 200
+    except Exception as e:
+        logger.error(f"Error getting balance: {e}")
+        return jsonify({"error": str(e)}), 500
     finally:
         db.close()
 
@@ -249,7 +268,6 @@ def fund_wallet():
         return jsonify({"error": "Invalid amount"}), 400
     
     if not email:
-        # Try to get email from user or use a placeholder
         email = f"user_{telegram_id}@deuceverify.com"
     
     db = SessionLocal()
@@ -260,7 +278,7 @@ def fund_wallet():
         # Initialize Paystack transaction
         payment_data = paystack.initialize_transaction(
             email=email,
-            amount=int(amount),  # Paystack expects amount in NGN (will convert to kobo internally)
+            amount=int(amount),
             user_id=user.id,
             telegram_id=telegram_id
         )
@@ -295,6 +313,7 @@ def get_transactions():
     """Get user's transaction history"""
     telegram_id = request.args.get('telegram_id')
     limit = request.args.get('limit', 50, type=int)
+    offset = request.args.get('offset', 0, type=int)
     
     if not telegram_id:
         return jsonify({"error": "telegram_id required"}), 400
@@ -311,7 +330,7 @@ def get_transactions():
             return jsonify({"error": "User not found"}), 404
         
         from database.crud import get_user_transactions
-        transactions = get_user_transactions(db, user.id, limit)
+        transactions = get_user_transactions(db, user.id, limit, offset)
         
         return jsonify({
             "transactions": [
@@ -321,11 +340,15 @@ def get_transactions():
                     "type": tx.type.value,
                     "status": tx.status,
                     "description": tx.description,
+                    "reference": tx.reference,
                     "created_at": tx.created_at.isoformat()
                 }
                 for tx in transactions
             ]
         }), 200
+    except Exception as e:
+        logger.error(f"Error getting transactions: {e}")
+        return jsonify({"error": str(e)}), 500
     finally:
         db.close()
 
@@ -336,6 +359,8 @@ def get_orders():
     """Get user's orders"""
     telegram_id = request.args.get('telegram_id')
     status = request.args.get('status')
+    order_type = request.args.get('type')
+    limit = request.args.get('limit', 50, type=int)
     
     if not telegram_id:
         return jsonify({"error": "telegram_id required"}), 400
@@ -351,25 +376,76 @@ def get_orders():
         if not user:
             return jsonify({"error": "User not found"}), 404
         
-        orders = get_user_orders(db, user.id, status)
+        orders = get_user_orders(db, user.id, status, order_type, limit)
         
         return jsonify({
             "orders": [
                 {
                     "id": order.id,
                     "type": order.order_type.value,
+                    "service_id": order.service_id,
                     "service": order.service_name,
+                    "country_id": order.country_id,
                     "country": order.country_name,
                     "number": order.number,
                     "cost": order.cost,
                     "status": order.status.value,
                     "otp_code": order.otp_code,
                     "expires_at": order.expires_at.isoformat(),
-                    "created_at": order.created_at.isoformat()
+                    "created_at": order.created_at.isoformat(),
+                    "rental_duration": order.rental_duration
                 }
                 for order in orders
             ]
         }), 200
+    except Exception as e:
+        logger.error(f"Error getting orders: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/order/<int:order_id>', methods=['GET'])
+def get_order_details(order_id):
+    """Get specific order details"""
+    telegram_id = request.args.get('telegram_id')
+    
+    if not telegram_id:
+        return jsonify({"error": "telegram_id required"}), 400
+    
+    try:
+        telegram_id = int(telegram_id)
+    except ValueError:
+        return jsonify({"error": "Invalid telegram_id"}), 400
+    
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, telegram_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        
+        order = get_order(db, order_id, user.id)
+        if not order:
+            return jsonify({"error": "Order not found"}), 404
+        
+        return jsonify({
+            "id": order.id,
+            "type": order.order_type.value,
+            "service_id": order.service_id,
+            "service": order.service_name,
+            "country_id": order.country_id,
+            "country": order.country_name,
+            "number": order.number,
+            "cost": order.cost,
+            "status": order.status.value,
+            "otp_code": order.otp_code,
+            "expires_at": order.expires_at.isoformat(),
+            "created_at": order.created_at.isoformat(),
+            "updated_at": order.updated_at.isoformat(),
+            "rental_duration": order.rental_duration
+        }), 200
+    except Exception as e:
+        logger.error(f"Error getting order details: {e}")
+        return jsonify({"error": str(e)}), 500
     finally:
         db.close()
 
@@ -392,16 +468,13 @@ def get_order_otp(order_id):
             return jsonify({"error": "Order not found"}), 404
         
         # For active orders, try to fetch latest OTP from SMS-Man (synchronously)
-        if order.status.value in ["pending", "received"]:
+        if order.status.value in ["pending", "received"] and order.order_type.value == "activation":
             try:
-                # Use synchronous call to SMS-Man API
-                if order.order_type.value == "activation":
-                    # This is a synchronous call - no await needed
-                    import requests
-                    result = sms_man.get_activation_sms_sync(int(order.request_id))
-                    if result and result.get("sms_code"):
-                        update_order_otp(db, order_id, result["sms_code"])
-                        order.otp_code = result["sms_code"]
+                from api.services.sms_man import sms_man
+                result = sms_man.get_activation_sms_sync(int(order.request_id))
+                if result and result.get("sms_code"):
+                    update_order_otp(db, order_id, result["sms_code"])
+                    order.otp_code = result["sms_code"]
             except Exception as e:
                 logger.error(f"Error fetching OTP: {e}")
         
@@ -412,6 +485,117 @@ def get_order_otp(order_id):
             "status": order.status.value,
             "expires_at": order.expires_at.isoformat()
         }), 200
+    except Exception as e:
+        logger.error(f"Error getting OTP: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/order/<int:order_id>/cancel', methods=['POST'])
+def cancel_order(order_id):
+    """Cancel an order"""
+    telegram_id = request.args.get('telegram_id')
+    
+    if not telegram_id:
+        return jsonify({"error": "telegram_id required"}), 400
+    
+    db = SessionLocal()
+    try:
+        user = get_user_by_telegram_id(db, int(telegram_id))
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        
+        from database.crud import cancel_order as cancel_order_db
+        order = cancel_order_db(db, order_id, user.id)
+        
+        if not order:
+            return jsonify({"error": "Order not found or cannot be cancelled"}), 404
+        
+        # If no OTP received and within timeout, refund
+        if not order.otp_code and order.status.value == "cancelled":
+            update_user_balance(db, user.id, order.cost, "credit")
+            create_transaction(
+                db=db,
+                user_id=user.id,
+                amount=order.cost,
+                transaction_type="credit",
+                description=f"Refund for cancelled order #{order_id}"
+            )
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Order #{order_id} cancelled successfully",
+            "refund_issued": not order.otp_code
+        }), 200
+    except Exception as e:
+        logger.error(f"Error cancelling order: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+# ============ ADMIN ENDPOINTS ============
+
+@app.route('/api/admin/stats', methods=['GET'])
+def admin_stats():
+    """Get admin statistics (requires admin check)"""
+    telegram_id = request.args.get('telegram_id')
+    
+    if not telegram_id:
+        return jsonify({"error": "telegram_id required"}), 400
+    
+    # Check if user is admin
+    if int(telegram_id) not in settings.admin_ids:
+        return jsonify({"error": "Unauthorized"}), 403
+    
+    db = SessionLocal()
+    try:
+        from database.crud import get_admin_stats
+        stats = get_admin_stats(db)
+        
+        return jsonify(stats), 200
+    except Exception as e:
+        logger.error(f"Error getting admin stats: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        db.close()
+
+@app.route('/api/admin/users', methods=['GET'])
+def admin_users():
+    """Get all users (requires admin check)"""
+    telegram_id = request.args.get('telegram_id')
+    limit = request.args.get('limit', 100, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    
+    if not telegram_id:
+        return jsonify({"error": "telegram_id required"}), 400
+    
+    # Check if user is admin
+    if int(telegram_id) not in settings.admin_ids:
+        return jsonify({"error": "Unauthorized"}), 403
+    
+    db = SessionLocal()
+    try:
+        from database.crud import get_all_users
+        users = get_all_users(db, limit, offset)
+        total = get_user_count(db)
+        
+        return jsonify({
+            "total": total,
+            "users": [
+                {
+                    "id": user.id,
+                    "telegram_id": user.telegram_id,
+                    "username": user.username,
+                    "balance": user.balance,
+                    "is_admin": user.is_admin,
+                    "created_at": user.created_at.isoformat()
+                }
+                for user in users
+            ]
+        }), 200
+    except Exception as e:
+        logger.error(f"Error getting users: {e}")
+        return jsonify({"error": str(e)}), 500
     finally:
         db.close()
 
@@ -422,7 +606,8 @@ def not_found(error):
     """Handle 404 errors"""
     return jsonify({
         "error": "Endpoint not found",
-        "message": "The requested endpoint does not exist"
+        "message": "The requested endpoint does not exist",
+        "path": request.path
     }), 404
 
 @app.errorhandler(500)
@@ -434,18 +619,46 @@ def internal_error(error):
         "message": "An unexpected error occurred"
     }), 500
 
-# ============ RUN BOT IN BACKGROUND ============
+@app.errorhandler(400)
+def bad_request(error):
+    """Handle 400 errors"""
+    return jsonify({
+        "error": "Bad request",
+        "message": str(error.description) if hasattr(error, 'description') else "Invalid request"
+    }), 400
 
-def run_bot():
-    """Run the Telegram bot in a separate thread"""
-    try:
-        from bot.main import main
-        # Create new event loop for this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(main())
-    except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
+# ============ HELPER FUNCTIONS ============
+
+def format_amount(amount: float) -> str:
+    """Format amount for display"""
+    return f"₦{amount:,.2f}"
+
+# ============ RUN BOT IN SEPARATE PROCESS ============
+
+def run_bot_process():
+    """Run the telegram bot in a separate process"""
+    import asyncio
+    import threading
+    
+    def run_bot():
+        """Run bot in thread with its own event loop"""
+        try:
+            from bot.main import main
+            
+            # Create new event loop for this thread
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Run the bot
+            loop.run_until_complete(main())
+            loop.close()
+        except Exception as e:
+            logger.error(f"Failed to start bot: {e}")
+    
+    # Start bot in daemon thread
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    return bot_thread
 
 # ============ MAIN ENTRY POINT ============
 
@@ -459,18 +672,24 @@ if __name__ == "__main__":
     print(f"💳 Paystack: {'✅ Configured' if settings.paystack_secret_key else '❌ Missing'}")
     print(f"📱 SMS-Man: {'✅ Configured' if settings.sms_man_token else '❌ Missing'}")
     print(f"💾 Database: {'✅ Configured' if settings.database_url else '❌ Missing'}")
+    print(f"💰 Min Funding: ₦{settings.minimum_funding_ngn}")
+    print(f"📈 Profit Margin: {settings.profit_margin}%")
     print("=" * 60)
     
-    # Start bot in background thread
-    bot_thread = Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+    # Start bot in background
+    bot_thread = run_bot_process()
     logger.info("🤖 Bot started in background thread")
     
     # Run Flask API
     logger.info(f"🌐 Starting Flask API on port {settings.flask_port}")
-    app.run(
-        host="0.0.0.0",
-        port=settings.flask_port,
-        debug=False,
-        threaded=True
-    )
+    try:
+        app.run(
+            host="0.0.0.0",
+            port=settings.flask_port,
+            debug=False,
+            threaded=True,
+            use_reloader=False  # Important: Prevents double-starting the bot
+        )
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+        sys.exit(0)
