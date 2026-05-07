@@ -1,630 +1,922 @@
-# Admin handler
 """
-Admin commands for DeuceVerify
-Admin-only functions: refunds, user management, system stats
+Admin handlers for DeuceVerify bot
+Handles admin commands for user management, refunds, and system monitoring
 """
 
 from aiogram import Router, F
-from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from datetime import datetime, timedelta
-import os
-from loguru import logger
+import logging
 
+from database.db import SessionLocal
+from database.crud import (
+    get_user_by_telegram_id,
+    get_user_by_id,
+    get_all_users,
+    get_user_count,
+    get_user_orders,
+    get_user_transactions,
+    get_order,
+    update_order_status,
+    update_user_balance,
+    create_transaction,
+    get_admin_stats
+)
+from database.models import OrderStatus, TransactionType
+from config import settings
+
+logger = logging.getLogger(__name__)
 router = Router()
 
-# Admin check decorator
-def admin_only(func):
-    async def wrapper(message: Message, *args, **kwargs):
-        admin_ids = os.getenv('ADMIN_IDS', '').split(',')
-        if str(message.from_user.id) not in admin_ids:
-            await message.answer("⛔ Access denied. Admin only.")
-            return
-        return await func(message, *args, **kwargs)
-    return wrapper
+# ============ FSM STATES ============
 
 class AdminStates(StatesGroup):
-    waiting_refund_user_id = State()
-    waiting_refund_order_id = State()
-    waiting_manual_balance = State()
-    waiting_broadcast = State()
+    """Admin FSM states"""
+    waiting_for_refund_order_id = State()
+    waiting_for_add_balance_user = State()
+    waiting_for_add_balance_amount = State()
+    waiting_for_broadcast_message = State()
+    waiting_for_user_telegram_id = State()
 
-# ==================== ADMIN MAIN MENU ====================
+# ============ HELPER FUNCTIONS ============
+
+def is_admin(user_id: int) -> bool:
+    """Check if user is an admin"""
+    return user_id in settings.admin_ids
+
+def format_price(amount: float) -> str:
+    """Format price with currency"""
+    return f"₦{amount:,.2f}"
+
+def format_date(date: datetime) -> str:
+    """Format datetime for display"""
+    return date.strftime("%Y-%m-%d %H:%M:%S")
+
+def get_status_emoji(status: str) -> str:
+    """Get emoji for order status"""
+    status_emoji = {
+        'pending': '⏳',
+        'received': '✅',
+        'expired': '❌',
+        'cancelled': '🚫',
+        'completed': '🎉'
+    }
+    return status_emoji.get(status, '📋')
+
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    """Get admin main menu keyboard"""
+    keyboard = [
+        [InlineKeyboardButton(text="👥 Users", callback_data="admin_users"),
+         InlineKeyboardButton(text="📊 Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="💰 Refund", callback_data="admin_refund"),
+         InlineKeyboardButton(text="➕ Add Balance", callback_data="admin_add_balance")],
+        [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast"),
+         InlineKeyboardButton(text="📋 All Orders", callback_data="admin_orders")],
+        [InlineKeyboardButton(text="🔙 Back to Menu", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_users_keyboard(users: list, page: int = 1, total_pages: int = 1) -> InlineKeyboardMarkup:
+    """Get users list keyboard with pagination"""
+    keyboard = []
+    
+    for user in users:
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"👤 {user.username or user.telegram_id} - ₦{user.balance:,.0f}",
+                callback_data=f"admin_user_{user.id}"
+            )
+        ])
+    
+    # Pagination buttons
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton(text="◀️ Previous", callback_data=f"admin_users_page_{page-1}"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton(text="Next ▶️", callback_data=f"admin_users_page_{page+1}"))
+    
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+    
+    keyboard.append([InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+def get_orders_keyboard(orders: list, page: int = 1, total_pages: int = 1) -> InlineKeyboardMarkup:
+    """Get admin orders list keyboard"""
+    keyboard = []
+    
+    for order in orders[:10]:
+        status_emoji = get_status_emoji(order.status.value)
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"{status_emoji} #{order.id} - {order.service_name} - {order.number}",
+                callback_data=f"admin_order_{order.id}"
+            )
+        ])
+    
+    # Pagination
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton(text="◀️ Previous", callback_data=f"admin_orders_page_{page-1}"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton(text="Next ▶️", callback_data=f"admin_orders_page_{page+1}"))
+    
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+    
+    keyboard.append([InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel")])
+    
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+# ============ ADMIN ACCESS CHECK ============
+
+async def check_admin(message: Message) -> bool:
+    """Check if user is admin and return appropriate response"""
+    if not is_admin(message.from_user.id):
+        await message.answer(
+            "⛔ <b>Access Denied</b>\n\n"
+            "You don't have permission to use admin commands.\n"
+            "This incident has been logged.",
+            parse_mode="HTML"
+        )
+        logger.warning(f"Unauthorized admin access attempt by {message.from_user.id}")
+        return False
+    return True
+
+# ============ ADMIN COMMANDS ============
 
 @router.message(Command("admin"))
-@admin_only
 async def admin_panel(message: Message):
     """Show admin panel"""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Dashboard", callback_data="admin_dashboard"),
-         InlineKeyboardButton(text="👥 Users", callback_data="admin_users")],
-        [InlineKeyboardButton(text="📱 Orders", callback_data="admin_orders"),
-         InlineKeyboardButton(text="💰 Refunds", callback_data="admin_refunds")],
-        [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast"),
-         InlineKeyboardButton(text="📈 Stats", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="⚙️ Settings", callback_data="admin_settings")]
-    ])
+    if not await check_admin(message):
+        return
     
+    db = SessionLocal()
+    try:
+        stats = get_admin_stats(db)
+        
+        admin_text = (
+            f"🔐 <b>Admin Control Panel</b>\n\n"
+            f"<b>System Statistics:</b>\n"
+            f"• 👥 Total Users: {stats['total_users']}\n"
+            f"• 📦 Total Orders: {stats['total_orders']}\n"
+            f"• ⏳ Active Orders: {stats['active_orders']}\n"
+            f"• 💰 Total Volume: {format_price(stats['total_volume'])}\n\n"
+            f"<b>Quick Actions:</b>\n"
+            f"• Issue refunds for failed orders\n"
+            f"• Add balance to user accounts\n"
+            f"• Send broadcast messages\n"
+            f"• View user and order details\n\n"
+            f"<i>Select an option below:</i>"
+        )
+        
+        await message.answer(
+            admin_text,
+            parse_mode="HTML",
+            reply_markup=get_admin_keyboard()
+        )
+    finally:
+        db.close()
+
+@router.message(Command("refund"))
+async def refund_command(message: Message, state: FSMContext):
+    """Handle /refund command"""
+    if not await check_admin(message):
+        return
+    
+    # Check if order ID was provided
+    parts = message.text.split()
+    if len(parts) > 1:
+        try:
+            order_id = int(parts[1])
+            await process_refund(message, order_id)
+            return
+        except ValueError:
+            await message.answer(
+                "❌ <b>Invalid Order ID</b>\n\n"
+                "Please provide a valid order ID.\n"
+                "Example: <code>/refund 12345</code>",
+                parse_mode="HTML"
+            )
+            return
+    
+    # If no ID provided, ask for it
+    await state.set_state(AdminStates.waiting_for_refund_order_id)
     await message.answer(
-        "🔐 <b>Admin Control Panel</b>\n\n"
-        "Welcome to DeuceVerify Admin Panel.\n"
-        "Select an option below:",
-        reply_markup=keyboard
-    )
-
-# ==================== DASHBOARD ====================
-
-@router.callback_query(F.data == "admin_dashboard")
-async def admin_dashboard(callback: CallbackQuery, db_manager):
-    """Show admin dashboard with stats"""
-    session = db_manager.get_session()
-    
-    try:
-        from models.database import User, Order, Transaction
-        
-        # Get stats
-        total_users = session.query(User).count()
-        active_users = session.query(User).filter(User.last_active >= datetime.utcnow() - timedelta(days=7)).count()
-        total_orders = session.query(Order).count()
-        active_orders = session.query(Order).filter(Order.status.in_(['active', 'pending'])).count()
-        total_revenue = session.query(Transaction).filter(Transaction.type == 'debit', Transaction.status == 'completed').all()
-        total_revenue_sum = sum(t.amount for t in total_revenue)
-        
-        # Recent activity
-        recent_orders = session.query(Order).order_by(Order.created_at.desc()).limit(5).all()
-        recent_users = session.query(User).order_by(User.created_at.desc()).limit(5).all()
-        
-        text = (
-            "📊 <b>Admin Dashboard</b>\n\n"
-            f"👥 <b>Users:</b>\n"
-            f"  • Total: {total_users}\n"
-            f"  • Active (7d): {active_users}\n\n"
-            f"📱 <b>Orders:</b>\n"
-            f"  • Total: {total_orders}\n"
-            f"  • Active: {active_orders}\n\n"
-            f"💰 <b>Revenue:</b>\n"
-            f"  • Total: ${total_revenue_sum:.2f}\n\n"
-            f"🔄 <b>Recent Orders:</b>\n"
-        )
-        
-        for order in recent_orders:
-            text += f"  • #{order.id} - {order.service_name} - ${order.cost:.2f}\n"
-        
-        text += f"\n👤 <b>Recent Users:</b>\n"
-        for user in recent_users[:3]:
-            text += f"  • {user.first_name or 'User'} - ${user.balance:.2f}\n"
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Refresh", callback_data="admin_dashboard")],
-            [InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_back")]
-        ])
-        
-        await callback.message.edit_text(text, reply_markup=keyboard)
-        
-    except Exception as e:
-        logger.error(f"Admin dashboard error: {e}")
-        await callback.message.edit_text("❌ Error loading dashboard")
-    finally:
-        session.close()
-
-# Add this to admin.py for profit tracking
-
-@router.callback_query(F.data == "admin_profit_analytics")
-async def admin_profit_analytics(callback: CallbackQuery, db_manager):
-    """Show profit analytics"""
-    session = db_manager.get_session()
-    
-    try:
-        from models.database import Order, Transaction
-        from sqlalchemy import func
-        
-        # Calculate total profit
-        orders = session.query(Order).filter(Order.status.in_(['received', 'active'])).all()
-        total_revenue = sum(o.cost for o in orders)
-        total_cost = sum(getattr(o, 'original_cost', o.cost / 2) for o in orders)
-        total_profit = total_revenue - total_cost
-        avg_profit_percent = (total_profit / total_cost * 100) if total_cost > 0 else 0
-        
-        # Profit by service
-        profit_by_service = session.query(
-            Order.service_name,
-            func.sum(Order.cost).label('revenue'),
-            func.sum(getattr(Order, 'original_cost', Order.cost / 2)).label('cost')
-        ).group_by(Order.service_name).limit(10).all()
-        
-        text = (
-            "💰 <b>Profit Analytics</b>\n\n"
-            f"📊 <b>Overview</b>\n"
-            f"├─ Total Orders: {len(orders)}\n"
-            f"├─ Total Revenue: ${total_revenue:.2f}\n"
-            f"├─ Total Cost: ${total_cost:.2f}\n"
-            f"└─ <b>Total Profit: ${total_profit:.2f}</b>\n\n"
-            f"📈 <b>Margin</b>\n"
-            f"├─ Average Profit %: {avg_profit_percent:.1f}%\n"
-            f"└─ Markup Multiplier: {sms_client.profit_margin}x\n\n"
-            f"🏆 <b>Top Services by Profit</b>\n"
-        )
-        
-        for service in profit_by_service[:5]:
-            revenue = service[1] or 0
-            cost = service[2] or 0
-            profit = revenue - cost
-            text += f"├─ {service[0]}: +${profit:.2f}\n"
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Export Profit Report", callback_data="admin_export_profit")],
-            [InlineKeyboardButton(text="⚙️ Adjust Markup", callback_data="admin_adjust_markup")],
-            [InlineKeyboardButton(text="🔙 Back", callback_data="admin_back")]
-        ])
-        
-        await callback.message.edit_text(text, reply_markup=keyboard)
-        
-    except Exception as e:
-        logger.error(f"Profit analytics error: {e}")
-        await callback.message.edit_text("❌ Error loading profit data")
-    finally:
-        session.close()
-
-# ==================== USER MANAGEMENT ====================
-
-@router.callback_query(F.data == "admin_users")
-async def admin_users(callback: CallbackQuery, db_manager):
-    """Show user management panel"""
-    session = db_manager.get_session()
-    
-    try:
-        from models.database import User
-        
-        users = session.query(User).order_by(User.created_at.desc()).limit(20).all()
-        
-        text = "👥 <b>User Management</b>\n\n"
-        
-        for user in users[:10]:
-            text += (
-                f"┌ <b>ID:</b> {user.telegram_id}\n"
-                f"├ @{user.username or 'no username'}\n"
-                f"├ Balance: ${user.balance:.2f}\n"
-                f"├ Orders: {user.total_orders}\n"
-                f"└ Joined: {user.created_at.strftime('%Y-%m-%d')}\n\n"
-            )
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Search User", callback_data="admin_search_user")],
-            [InlineKeyboardButton(text="💰 Modify Balance", callback_data="admin_modify_balance")],
-            [InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_back")]
-        ])
-        
-        await callback.message.edit_text(text, reply_markup=keyboard)
-        
-    except Exception as e:
-        logger.error(f"Admin users error: {e}")
-        await callback.message.edit_text("❌ Error loading users")
-    finally:
-        session.close()
-
-@router.callback_query(F.data == "admin_modify_balance")
-async def admin_modify_balance(callback: CallbackQuery, state: FSMContext):
-    """Start balance modification flow"""
-    await callback.message.answer(
-        "💰 <b>Modify User Balance</b>\n\n"
-        "Please enter the user's Telegram ID:\n\n"
-        "Example: <code>123456789</code>\n\n"
-        "Type /cancel to cancel.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Cancel", callback_data="admin_back")]
-        ])
-    )
-    await state.set_state(AdminStates.waiting_refund_user_id)
-
-@router.message(AdminStates.waiting_refund_user_id)
-async def get_user_for_balance(message: Message, state: FSMContext, db_manager):
-    """Get user for balance modification"""
-    try:
-        telegram_id = int(message.text.strip())
-        await state.update_data(target_user_id=telegram_id)
-        
-        session = db_manager.get_session()
-        from models.database import User
-        
-        user = session.query(User).filter_by(telegram_id=telegram_id).first()
-        session.close()
-        
-        if user:
-            await message.answer(
-                f"👤 User found: @{user.username or user.first_name}\n"
-                f"Current balance: ${user.balance:.2f}\n\n"
-                f"Enter the amount to ADD or SUBTRACT:\n"
-                f"Example: <code>+50</code> to add $50\n"
-                f"Example: <code>-20</code> to subtract $20\n\n"
-                f"Or type /cancel to cancel."
-            )
-            await state.set_state(AdminStates.waiting_manual_balance)
-        else:
-            await message.answer("❌ User not found. Please try again.")
-            await state.clear()
-            
-    except ValueError:
-        await message.answer("❌ Invalid Telegram ID. Please enter a number.")
-
-@router.message(AdminStates.waiting_manual_balance)
-async def modify_balance(message: Message, state: FSMContext, db_manager):
-    """Modify user balance"""
-    try:
-        amount_str = message.text.strip()
-        
-        if amount_str.startswith('+'):
-            amount = float(amount_str[1:])
-        elif amount_str.startswith('-'):
-            amount = -float(amount_str[1:])
-        else:
-            amount = float(amount_str)
-        
-        user_data = await state.get_data()
-        telegram_id = user_data.get('target_user_id')
-        
-        session = db_manager.get_session()
-        from models.database import User, Transaction, TransactionType, TransactionStatus
-        
-        user = session.query(User).filter_by(telegram_id=telegram_id).first()
-        
-        if user:
-            old_balance = user.balance
-            user.balance += amount
-            user.total_spent += amount if amount < 0 else 0
-            
-            # Create transaction record
-            tx = Transaction(
-                user_id=telegram_id,
-                amount=abs(amount),
-                type=TransactionType.CREDIT if amount > 0 else TransactionType.DEBIT,
-                status=TransactionStatus.COMPLETED,
-                payment_method="admin_manual",
-                description=f"Manual adjustment by admin: {amount:+.2f}"
-            )
-            session.add(tx)
-            session.commit()
-            
-            await message.answer(
-                f"✅ Balance updated!\n\n"
-                f"User: @{user.username or user.first_name}\n"
-                f"Change: ${amount:+.2f}\n"
-                f"Old balance: ${old_balance:.2f}\n"
-                f"New balance: ${user.balance:.2f}"
-            )
-            
-            # Notify user
-            try:
-                from aiogram import Bot
-                bot = Bot(token=os.getenv('BOT_TOKEN'))
-                await bot.send_message(
-                    telegram_id,
-                    f"🔔 <b>Balance Update</b>\n\n"
-                    f"Your balance has been adjusted by an admin.\n"
-                    f"Amount: ${amount:+.2f}\n"
-                    f"New balance: ${user.balance:.2f}"
-                )
-                await bot.session.close()
-            except Exception as e:
-                logger.error(f"Failed to notify user: {e}")
-        else:
-            await message.answer("❌ User not found.")
-        
-        await state.clear()
-        session.close()
-        
-    except ValueError:
-        await message.answer("❌ Invalid amount. Please enter a number.")
-
-# ==================== ORDER MANAGEMENT ====================
-
-@router.callback_query(F.data == "admin_orders")
-async def admin_orders(callback: CallbackQuery, db_manager):
-    """Show order management panel"""
-    session = db_manager.get_session()
-    
-    try:
-        from models.database import Order
-        
-        # Get pending refund requests (expired orders)
-        refund_requests = session.query(Order).filter(
-            Order.status == 'expired',
-            Order.expires_at < datetime.utcnow()
-        ).limit(10).all()
-        
-        recent_orders = session.query(Order).order_by(Order.created_at.desc()).limit(10).all()
-        
-        text = "📱 <b>Order Management</b>\n\n"
-        
-        if refund_requests:
-            text += "💰 <b>Pending Refund Requests:</b>\n"
-            for order in refund_requests:
-                text += f"  • #{order.id} - {order.service_name} - ${order.cost:.2f} - User: {order.user_id}\n"
-            text += "\n"
-        
-        text += "📋 <b>Recent Orders:</b>\n"
-        for order in recent_orders:
-            text += f"  • #{order.id} - {order.service_name} - ${order.cost:.2f} - {order.status}\n"
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💰 Process Refund", callback_data="admin_refund_order")],
-            [InlineKeyboardButton(text="🔍 Search Order", callback_data="admin_search_order")],
-            [InlineKeyboardButton(text="📊 Export Orders", callback_data="admin_export_orders")],
-            [InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_back")]
-        ])
-        
-        await callback.message.edit_text(text, reply_markup=keyboard)
-        
-    except Exception as e:
-        logger.error(f"Admin orders error: {e}")
-    finally:
-        session.close()
-
-@router.callback_query(F.data == "admin_refund_order")
-async def admin_refund_order(callback: CallbackQuery, state: FSMContext):
-    """Start refund process"""
-    await callback.message.answer(
         "💰 <b>Process Refund</b>\n\n"
-        "Enter the Order ID to refund:\n\n"
-        "Example: <code>12345</code>\n\n"
-        "Type /cancel to cancel.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Cancel", callback_data="admin_back")]
-        ])
+        "Please enter the order ID to refund:\n\n"
+        "<i>Example: 12345</i>\n"
+        "Send /cancel to abort.",
+        parse_mode="HTML"
     )
-    await state.set_state(AdminStates.waiting_refund_order_id)
 
-@router.message(AdminStates.waiting_refund_order_id)
-async def process_refund(message: Message, state: FSMContext, db_manager):
-    """Process refund for order"""
+@router.message(AdminStates.waiting_for_refund_order_id)
+async def process_refund_order_id(message: Message, state: FSMContext):
+    """Process refund order ID input"""
+    if message.text.lower() == "/cancel":
+        await state.clear()
+        await message.answer("❌ Refund cancelled.", reply_markup=get_admin_keyboard())
+        return
+    
     try:
         order_id = int(message.text.strip())
-        
-        session = db_manager.get_session()
-        from models.database import Order, OrderStatus, User, Transaction, TransactionType, TransactionStatus
-        
-        order = session.query(Order).filter_by(id=order_id).first()
-        
+        await process_refund(message, order_id)
+        await state.clear()
+    except ValueError:
+        await message.answer(
+            "❌ <b>Invalid Order ID</b>\n\n"
+            "Please enter a valid number.\n"
+            "Send /cancel to abort.",
+            parse_mode="HTML"
+        )
+
+async def process_refund(message: Message, order_id: int):
+    """Process refund for an order"""
+    db = SessionLocal()
+    try:
+        order = get_order(db, order_id)
         if not order:
-            await message.answer(f"❌ Order #{order_id} not found.")
-            await state.clear()
+            await message.answer(
+                f"❌ <b>Order Not Found</b>\n\n"
+                f"Order #{order_id} does not exist.",
+                parse_mode="HTML"
+            )
             return
         
-        if order.status.value != 'expired' and not order.otp_code:
+        if order.status.value in ["expired", "cancelled"]:
+            # Check if already refunded
+            # This would need a refund flag in the database
             await message.answer(
-                f"⚠️ Order #{order_id} status: {order.status.value}\n"
-                f"Refund only available for expired orders without OTP.\n\n"
-                f"Continue anyway?"
+                f"💰 <b>Refund Order #{order_id}</b>\n\n"
+                f"<b>Order Details:</b>\n"
+                f"• User: {order.user_id}\n"
+                f"• Service: {order.service_name}\n"
+                f"• Amount: {format_price(order.cost)}\n"
+                f"• Status: {order.status.value}\n\n"
+                f"⚠️ This order is already {order.status.value}.\n\n"
+                f"Refund amount: {format_price(order.cost)}\n\n"
+                f"Confirm refund?",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Yes, Refund", callback_data=f"admin_refund_confirm_{order_id}")],
+                    [InlineKeyboardButton(text="❌ Cancel", callback_data="admin_panel")]
+                ])
             )
-        
-        # Process refund
-        user = session.query(User).filter_by(telegram_id=order.user_id).first()
-        
-        if user:
-            old_balance = user.balance
-            user.balance += order.cost
-            
-            # Create refund transaction
-            refund_tx = Transaction(
-                user_id=order.user_id,
-                amount=order.cost,
-                type=TransactionType.CREDIT,
-                status=TransactionStatus.COMPLETED,
-                payment_method="admin_refund",
-                description=f"Refund for order #{order_id}",
-                order_id=order_id
-            )
-            session.add(refund_tx)
-            
-            # Update order
-            order.status = OrderStatus.REFUNDED
-            session.commit()
-            
-            await message.answer(
-                f"✅ Refund processed!\n\n"
-                f"Order #{order_id}\n"
-                f"Amount: ${order.cost:.2f}\n"
-                f"User: @{user.username or user.first_name}\n"
-                f"New balance: ${user.balance:.2f}"
-            )
-            
-            # Notify user
-            try:
-                from aiogram import Bot
-                bot = Bot(token=os.getenv('BOT_TOKEN'))
-                await bot.send_message(
-                    order.user_id,
-                    f"💰 <b>Refund Processed</b>\n\n"
-                    f"Order #{order_id} has been refunded.\n"
-                    f"Amount: <b>${order.cost:.2f}</b>\n"
-                    f"New balance: <b>${user.balance:.2f}</b>\n\n"
-                    f"Thank you for your patience!"
-                )
-                await bot.session.close()
-            except Exception as e:
-                logger.error(f"Failed to notify user: {e}")
         else:
-            await message.answer(f"❌ User not found for order #{order_id}")
-        
-        await state.clear()
-        session.close()
-        
-    except ValueError:
-        await message.answer("❌ Invalid Order ID. Please enter a number.")
+            await message.answer(
+                f"⚠️ <b>Order #{order_id}</b>\n\n"
+                f"This order is still {order.status.value}.\n"
+                f"Refunds are typically issued for expired/cancelled orders.\n\n"
+                f"Refund amount: {format_price(order.cost)}\n\n"
+                f"Confirm refund anyway?",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Yes, Force Refund", callback_data=f"admin_refund_confirm_{order_id}")],
+                    [InlineKeyboardButton(text="❌ Cancel", callback_data="admin_panel")]
+                ])
+            )
+    finally:
+        db.close()
 
-# ==================== BROADCAST ====================
+@router.callback_query(F.data.startswith("admin_refund_confirm_"))
+async def confirm_refund(callback: CallbackQuery):
+    """Confirm and process refund"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[3])
+    
+    db = SessionLocal()
+    try:
+        order = get_order(db, order_id)
+        if not order:
+            await callback.message.edit_text("❌ Order not found.")
+            await callback.answer()
+            return
+        
+        # Get user
+        user = get_user_by_id(db, order.user_id)
+        if not user:
+            await callback.message.edit_text("❌ User not found.")
+            await callback.answer()
+            return
+        
+        # Update user balance
+        update_user_balance(db, user.id, order.cost, "credit")
+        
+        # Create transaction record
+        create_transaction(
+            db=db,
+            user_id=user.id,
+            amount=order.cost,
+            transaction_type="credit",
+            description=f"Admin refund for order #{order_id} - {order.service_name}",
+            status="completed"
+        )
+        
+        # Update order status if still pending
+        if order.status.value == "pending":
+            update_order_status(db, order_id, "cancelled")
+        
+        await callback.message.edit_text(
+            f"✅ <b>Refund Processed Successfully</b>\n\n"
+            f"<b>Order #{order_id}</b>\n"
+            f"• Amount: {format_price(order.cost)}\n"
+            f"• User: {user.telegram_id} (@{user.username or 'No username'})\n"
+            f"• New Balance: {format_price(user.balance + order.cost)}\n\n"
+            f"Refund has been credited to user's wallet.",
+            parse_mode="HTML",
+            reply_markup=get_admin_keyboard()
+        )
+        
+        # Notify user about refund
+        from bot.main import bot
+        try:
+            await bot.send_message(
+                user.telegram_id,
+                f"💰 <b>Refund Issued</b>\n\n"
+                f"Your order #{order_id} has been refunded.\n"
+                f"Amount: {format_price(order.cost)}\n\n"
+                f"Reason: Admin refund\n\n"
+                f"Your new balance: {format_price(user.balance + order.cost)}",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user about refund: {e}")
+        
+        await callback.answer()
+        
+    except Exception as e:
+        logger.error(f"Error processing refund: {e}")
+        await callback.message.edit_text(
+            f"❌ <b>Refund Failed</b>\n\n"
+            f"Error: {str(e)}",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+    finally:
+        db.close()
+
+@router.message(Command("addbalance"))
+async def add_balance_command(message: Message, state: FSMContext):
+    """Handle /addbalance command"""
+    if not await check_admin(message):
+        return
+    
+    parts = message.text.split()
+    if len(parts) == 3:
+        try:
+            user_identifier = parts[1]
+            amount = float(parts[2])
+            
+            # Determine if it's telegram_id or username
+            db = SessionLocal()
+            try:
+                if user_identifier.startswith('@'):
+                    username = user_identifier[1:]
+                    user = db.query(User).filter(User.username == username).first()
+                else:
+                    telegram_id = int(user_identifier)
+                    user = get_user_by_telegram_id(db, telegram_id)
+                
+                if user:
+                    await process_add_balance(message, user, amount)
+                else:
+                    await message.answer(
+                        f"❌ <b>User Not Found</b>\n\n"
+                        f"Could not find user: {user_identifier}",
+                        parse_mode="HTML"
+                    )
+            finally:
+                db.close()
+            return
+        except ValueError:
+            await message.answer(
+                "❌ <b>Invalid Amount</b>\n\n"
+                "Please provide a valid amount.\n"
+                "Example: <code>/addbalance @username 1000</code>",
+                parse_mode="HTML"
+            )
+            return
+    
+    # If not enough arguments, ask for user
+    await state.set_state(AdminStates.waiting_for_add_balance_user)
+    await message.answer(
+        "➕ <b>Add Balance</b>\n\n"
+        "Please enter the user (Telegram ID or @username):\n\n"
+        "<i>Example: 123456789 or @username</i>\n"
+        "Send /cancel to abort.",
+        parse_mode="HTML"
+    )
+
+@router.message(AdminStates.waiting_for_add_balance_user)
+async def add_balance_user(message: Message, state: FSMContext):
+    """Get user for adding balance"""
+    if message.text.lower() == "/cancel":
+        await state.clear()
+        await message.answer("❌ Operation cancelled.", reply_markup=get_admin_keyboard())
+        return
+    
+    user_identifier = message.text.strip()
+    await state.update_data(user_identifier=user_identifier)
+    await state.set_state(AdminStates.waiting_for_add_balance_amount)
+    
+    await message.answer(
+        f"💰 <b>Enter Amount</b>\n\n"
+        f"User: {user_identifier}\n\n"
+        f"Enter the amount to add (NGN):\n"
+        f"<i>Example: 5000</i>\n"
+        f"Send /cancel to abort.",
+        parse_mode="HTML"
+    )
+
+@router.message(AdminStates.waiting_for_add_balance_amount)
+async def add_balance_amount(message: Message, state: FSMContext):
+    """Process add balance amount"""
+    if message.text.lower() == "/cancel":
+        await state.clear()
+        await message.answer("❌ Operation cancelled.", reply_markup=get_admin_keyboard())
+        return
+    
+    try:
+        amount = float(message.text.strip())
+        if amount <= 0:
+            await message.answer(
+                "❌ <b>Invalid Amount</b>\n\n"
+                "Amount must be greater than 0.",
+                parse_mode="HTML"
+            )
+            return
+        
+        data = await state.get_data()
+        user_identifier = data.get('user_identifier')
+        
+        db = SessionLocal()
+        try:
+            if user_identifier.startswith('@'):
+                username = user_identifier[1:]
+                user = db.query(User).filter(User.username == username).first()
+            else:
+                telegram_id = int(user_identifier)
+                user = get_user_by_telegram_id(db, telegram_id)
+            
+            if user:
+                await process_add_balance(message, user, amount)
+                await state.clear()
+            else:
+                await message.answer(
+                    f"❌ <b>User Not Found</b>\n\n"
+                    f"Could not find user: {user_identifier}",
+                    parse_mode="HTML"
+                )
+        finally:
+            db.close()
+            
+    except ValueError:
+        await message.answer(
+            "❌ <b>Invalid Amount</b>\n\n"
+            "Please enter a valid number.",
+            parse_mode="HTML"
+        )
+
+async def process_add_balance(message: Message, user, amount: float):
+    """Process adding balance to user"""
+    db = SessionLocal()
+    try:
+        old_balance = user.balance
+        update_user_balance(db, user.id, amount, "credit")
+        create_transaction(
+            db=db,
+            user_id=user.id,
+            amount=amount,
+            transaction_type="credit",
+            description=f"Admin credit - Added by admin",
+            status="completed"
+        )
+        
+        await message.answer(
+            f"✅ <b>Balance Added Successfully</b>\n\n"
+            f"<b>User:</b> {user.telegram_id} (@{user.username or 'No username'})\n"
+            f"<b>Old Balance:</b> {format_price(old_balance)}\n"
+            f"<b>Amount Added:</b> {format_price(amount)}\n"
+            f"<b>New Balance:</b> {format_price(user.balance + amount)}\n\n"
+            f"Transaction recorded successfully.",
+            parse_mode="HTML",
+            reply_markup=get_admin_keyboard()
+        )
+        
+        # Notify user
+        from bot.main import bot
+        try:
+            await bot.send_message(
+                user.telegram_id,
+                f"➕ <b>Balance Updated</b>\n\n"
+                f"An admin has added {format_price(amount)} to your wallet.\n\n"
+                f"<b>New Balance:</b> {format_price(user.balance + amount)}",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Failed to notify user: {e}")
+            
+    except Exception as e:
+        logger.error(f"Error adding balance: {e}")
+        await message.answer(
+            f"❌ <b>Failed to Add Balance</b>\n\n"
+            f"Error: {str(e)}",
+            parse_mode="HTML"
+        )
+    finally:
+        db.close()
+
+# ============ BROADCAST ============
 
 @router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast(callback: CallbackQuery, state: FSMContext):
-    """Start broadcast message"""
-    await callback.message.answer(
-        "📢 <b>Broadcast Message</b>\n\n"
-        "Send the message you want to broadcast to all users.\n\n"
-        "Supported: Text, emojis, HTML formatting.\n\n"
-        "Type /cancel to cancel.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Cancel", callback_data="admin_back")]
-        ])
+    """Start broadcast message process"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_broadcast_message)
+    await callback.message.edit_text(
+        "📢 <b>Send Broadcast Message</b>\n\n"
+        "Please send the message you want to broadcast to all users.\n\n"
+        "<i>Supported: Text, emojis, and formatting\n"
+        "Send /cancel to abort</i>",
+        parse_mode="HTML"
     )
-    await state.set_state(AdminStates.waiting_broadcast)
+    await callback.answer()
 
-@router.message(AdminStates.waiting_broadcast)
-async def send_broadcast(message: Message, state: FSMContext, db_manager):
+@router.message(AdminStates.waiting_for_broadcast_message)
+async def process_broadcast(message: Message, state: FSMContext):
+    """Process and send broadcast message"""
+    if message.text.lower() == "/cancel":
+        await state.clear()
+        await message.answer("❌ Broadcast cancelled.", reply_markup=get_admin_keyboard())
+        return
+    
+    broadcast_text = message.text or message.caption
+    if not broadcast_text:
+        await message.answer(
+            "❌ <b>Invalid Message</b>\n\n"
+            "Please send a text message to broadcast.",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Confirm broadcast
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Yes, Send", callback_data="admin_broadcast_confirm")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="admin_panel")]
+    ])
+    
+    await state.update_data(broadcast_message=broadcast_text)
+    await message.answer(
+        f"📢 <b>Confirm Broadcast</b>\n\n"
+        f"Message to send:\n"
+        f"{'─' * 30}\n"
+        f"{broadcast_text}\n"
+        f"{'─' * 30}\n\n"
+        f"<i>This will be sent to ALL users.\n"
+        f"Confirm to proceed.</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@router.callback_query(F.data == "admin_broadcast_confirm")
+async def confirm_broadcast(callback: CallbackQuery, state: FSMContext):
     """Send broadcast to all users"""
-    broadcast_text = message.html_text
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized", show_alert=True)
+        return
     
-    await message.answer("⏳ Sending broadcast to all users... This may take a while.")
+    data = await state.get_data()
+    broadcast_text = data.get('broadcast_message')
     
-    session = db_manager.get_session()
+    if not broadcast_text:
+        await callback.message.edit_text("❌ No message to broadcast.")
+        await callback.answer()
+        return
     
+    await callback.message.edit_text(
+        "⏳ <b>Sending Broadcast...</b>\n\n"
+        "Please wait while messages are sent to all users.",
+        parse_mode="HTML"
+    )
+    
+    db = SessionLocal()
     try:
-        from models.database import User
-        
-        users = session.query(User).all()
-        
+        users = get_all_users(db, limit=1000)
         success_count = 0
         fail_count = 0
         
-        from aiogram import Bot
-        bot = Bot(token=os.getenv('BOT_TOKEN'))
+        from bot.main import bot
         
         for user in users:
             try:
                 await bot.send_message(
                     user.telegram_id,
-                    f"📢 <b>Announcement from DeuceVerify</b>\n\n{broadcast_text}",
+                    f"📢 <b>Announcement from Admin</b>\n\n{broadcast_text}",
                     parse_mode="HTML"
                 )
                 success_count += 1
-                await asyncio.sleep(0.05)  # Rate limiting
+                await asyncio.sleep(0.05)  # Small delay to avoid rate limiting
             except Exception as e:
+                logger.error(f"Failed to send broadcast to {user.telegram_id}: {e}")
                 fail_count += 1
-                logger.error(f"Failed to send to {user.telegram_id}: {e}")
         
-        await bot.session.close()
-        
-        await message.answer(
-            f"✅ Broadcast complete!\n\n"
-            f"Sent: {success_count}\n"
-            f"Failed: {fail_count}\n"
-            f"Total users: {len(users)}"
+        await callback.message.edit_text(
+            f"✅ <b>Broadcast Complete</b>\n\n"
+            f"<b>Statistics:</b>\n"
+            f"• ✅ Sent: {success_count}\n"
+            f"• ❌ Failed: {fail_count}\n"
+            f"• 📊 Total Users: {len(users)}\n\n"
+            f"Broadcast message sent successfully!",
+            parse_mode="HTML",
+            reply_markup=get_admin_keyboard()
         )
         
         await state.clear()
         
     except Exception as e:
-        logger.error(f"Broadcast error: {e}")
-        await message.answer(f"❌ Broadcast error: {e}")
-    finally:
-        session.close()
-
-# ==================== STATISTICS ====================
-
-@router.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: CallbackQuery, db_manager):
-    """Show detailed statistics"""
-    session = db_manager.get_session()
-    
-    try:
-        from models.database import User, Order, Transaction
-        from sqlalchemy import func
-        
-        # Time periods
-        today = datetime.utcnow().date()
-        week_ago = datetime.utcnow() - timedelta(days=7)
-        month_ago = datetime.utcnow() - timedelta(days=30)
-        
-        # User stats
-        total_users = session.query(User).count()
-        new_users_today = session.query(User).filter(func.date(User.created_at) == today).count()
-        new_users_week = session.query(User).filter(User.created_at >= week_ago).count()
-        
-        # Order stats
-        total_orders = session.query(Order).count()
-        orders_today = session.query(Order).filter(func.date(Order.created_at) == today).count()
-        completed_orders = session.query(Order).filter(Order.status == 'received').count()
-        
-        # Revenue stats
-        total_revenue = session.query(Transaction).filter(Transaction.type == 'debit', Transaction.status == 'completed').all()
-        total_revenue_sum = sum(t.amount for t in total_revenue)
-        
-        revenue_today = session.query(Transaction).filter(
-            Transaction.type == 'debit',
-            Transaction.status == 'completed',
-            func.date(Transaction.created_at) == today
-        ).all()
-        revenue_today_sum = sum(t.amount for t in revenue_today)
-        
-        revenue_week = session.query(Transaction).filter(
-            Transaction.type == 'debit',
-            Transaction.status == 'completed',
-            Transaction.created_at >= week_ago
-        ).all()
-        revenue_week_sum = sum(t.amount for t in revenue_week)
-        
-        text = (
-            "📈 <b>DeuceVerify Statistics</b>\n\n"
-            "👥 <b>Users</b>\n"
-            f"  • Total: {total_users}\n"
-            f"  • Today: +{new_users_today}\n"
-            f"  • Week: +{new_users_week}\n\n"
-            "📱 <b>Orders</b>\n"
-            f"  • Total: {total_orders}\n"
-            f"  • Today: {orders_today}\n"
-            f"  • Completed: {completed_orders}\n\n"
-            "💰 <b>Revenue</b>\n"
-            f"  • Total: ${total_revenue_sum:.2f}\n"
-            f"  • Today: ${revenue_today_sum:.2f}\n"
-            f"  • Week: ${revenue_week_sum:.2f}\n\n"
-            f"📊 <b>Success Rate:</b> {(completed_orders/total_orders*100 if total_orders > 0 else 0):.1f}%"
+        logger.error(f"Error in broadcast: {e}")
+        await callback.message.edit_text(
+            f"❌ <b>Broadcast Failed</b>\n\n"
+            f"Error: {str(e)}",
+            parse_mode="HTML"
         )
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Refresh", callback_data="admin_stats")],
-            [InlineKeyboardButton(text="📊 Export CSV", callback_data="admin_export_stats")],
-            [InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_back")]
-        ])
-        
-        await callback.message.edit_text(text, reply_markup=keyboard)
-        
-    except Exception as e:
-        logger.error(f"Stats error: {e}")
-        await callback.message.edit_text("❌ Error loading statistics")
     finally:
-        session.close()
-
-# ==================== SETTINGS ====================
-
-@router.callback_query(F.data == "admin_settings")
-async def admin_settings(callback: CallbackQuery):
-    """Show admin settings"""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💵 Set USD/NGN Rate", callback_data="admin_set_rate")],
-        [InlineKeyboardButton(text="⏱️ Set OTP Timeout", callback_data="admin_set_timeout")],
-        [InlineKeyboardButton(text="📊 Clear Cache", callback_data="admin_clear_cache")],
-        [InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_back")]
-    ])
+        db.close()
     
-    current_rate = os.getenv('USD_NGN_RATE', '1500')
-    current_timeout = os.getenv('OTP_TIMEOUT', '300')
-    
-    await callback.message.edit_text(
-        "⚙️ <b>Admin Settings</b>\n\n"
-        f"💵 USD to NGN Rate: ₦{current_rate}\n"
-        f"⏱️ OTP Timeout: {current_timeout} seconds\n\n"
-        f"Select an option to modify:",
-        reply_markup=keyboard
-    )
-
-# ==================== BACK BUTTON ====================
-
-@router.callback_query(F.data == "admin_back")
-async def admin_back(callback: CallbackQuery):
-    """Return to admin panel"""
-    await admin_panel(callback.message)
     await callback.answer()
 
-# ==================== IMPORT ASYNC FOR BROADCAST ====================
+# ============ ADMIN CALLBACKS ============
 
+@router.callback_query(F.data == "admin_panel")
+async def admin_panel_callback(callback: CallbackQuery):
+    """Return to admin panel"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized", show_alert=True)
+        return
+    
+    db = SessionLocal()
+    try:
+        stats = get_admin_stats(db)
+        
+        admin_text = (
+            f"🔐 <b>Admin Control Panel</b>\n\n"
+            f"<b>System Statistics:</b>\n"
+            f"• 👥 Total Users: {stats['total_users']}\n"
+            f"• 📦 Total Orders: {stats['total_orders']}\n"
+            f"• ⏳ Active Orders: {stats['active_orders']}\n"
+            f"• 💰 Total Volume: {format_price(stats['total_volume'])}\n\n"
+            f"<i>Select an option below:</i>"
+        )
+        
+        await callback.message.edit_text(
+            admin_text,
+            parse_mode="HTML",
+            reply_markup=get_admin_keyboard()
+        )
+        await callback.answer()
+    finally:
+        db.close()
+
+@router.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    """Show detailed statistics"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized", show_alert=True)
+        return
+    
+    db = SessionLocal()
+    try:
+        stats = get_admin_stats(db)
+        
+        # Get additional stats
+        from database.models import Order
+        today = datetime.utcnow().date()
+        today_start = datetime(today.year, today.month, today.day)
+        
+        today_orders = db.query(Order).filter(Order.created_at >= today_start).count()
+        today_volume = db.query(Order).filter(Order.created_at >= today_start).with_entities(db.func.sum(Order.cost)).scalar() or 0
+        
+        stats_text = (
+            f"📊 <b>Detailed Statistics</b>\n\n"
+            f"<b>Overall:</b>\n"
+            f"• 👥 Total Users: {stats['total_users']}\n"
+            f"• 📦 Total Orders: {stats['total_orders']}\n"
+            f"• ⏳ Active Orders: {stats['active_orders']}\n"
+            f"• 💰 Total Volume: {format_price(stats['total_volume'])}\n\n"
+            f"<b>Today:</b>\n"
+            f"• 📦 Today's Orders: {today_orders}\n"
+            f"• 💰 Today's Volume: {format_price(today_volume)}\n\n"
+            f"<b>System Health:</b>\n"
+            f"• ✅ Database: Connected\n"
+            f"• 🤖 Bot: Running\n"
+            f"• 💳 Paystack: {'✅' if settings.paystack_secret_key else '❌'}\n"
+            f"• 📱 SMS-Man: {'✅' if settings.sms_man_token else '❌'}\n\n"
+            f"<i>Last updated: {format_date(datetime.utcnow())}</i>"
+        )
+        
+        await callback.message.edit_text(
+            stats_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel")]
+            ])
+        )
+        await callback.answer()
+    finally:
+        db.close()
+
+@router.callback_query(F.data == "admin_users")
+async def admin_users_list(callback: CallbackQuery):
+    """Show list of users"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized", show_alert=True)
+        return
+    
+    db = SessionLocal()
+    try:
+        users = get_all_users(db, limit=20)
+        total_users = get_user_count(db)
+        total_pages = (total_users + 19) // 20
+        
+        if not users:
+            await callback.message.edit_text("No users found.")
+            await callback.answer()
+            return
+        
+        users_text = f"👥 <b>Users - Page 1/{total_pages}</b>\n\n"
+        for user in users:
+            users_text += f"• 👤 {user.telegram_id} - @{user.username or 'No username'} - {format_price(user.balance)}\n"
+        
+        await callback.message.edit_text(
+            users_text,
+            parse_mode="HTML",
+            reply_markup=get_users_keyboard(users, 1, total_pages)
+        )
+        await callback.answer()
+    finally:
+        db.close()
+
+@router.callback_query(F.data.startswith("admin_users_page_"))
+async def admin_users_page(callback: CallbackQuery):
+    """Handle users pagination"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized", show_alert=True)
+        return
+    
+    page = int(callback.data.split("_")[3])
+    limit = 20
+    offset = (page - 1) * limit
+    
+    db = SessionLocal()
+    try:
+        users = get_all_users(db, limit=limit, offset=offset)
+        total_users = get_user_count(db)
+        total_pages = (total_users + limit - 1) // limit
+        
+        users_text = f"👥 <b>Users - Page {page}/{total_pages}</b>\n\n"
+        for user in users:
+            users_text += f"• 👤 {user.telegram_id} - @{user.username or 'No username'} - {format_price(user.balance)}\n"
+        
+        await callback.message.edit_text(
+            users_text,
+            parse_mode="HTML",
+            reply_markup=get_users_keyboard(users, page, total_pages)
+        )
+        await callback.answer()
+    finally:
+        db.close()
+
+@router.callback_query(F.data == "admin_orders")
+async def admin_orders_list(callback: CallbackQuery):
+    """Show list of all orders"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized", show_alert=True)
+        return
+    
+    db = SessionLocal()
+    try:
+        from database.crud import get_all_orders
+        orders = get_all_orders(db, limit=20)
+        total_orders = db.query(Order).count()
+        total_pages = (total_orders + 19) // 20
+        
+        orders_text = f"📋 <b>All Orders - Page 1/{total_pages}</b>\n\n"
+        for order in orders[:10]:
+            status_emoji = get_status_emoji(order.status.value)
+            orders_text += f"{status_emoji} #{order.id} - {order.service_name} - {order.number}\n"
+        
+        await callback.message.edit_text(
+            orders_text,
+            parse_mode="HTML",
+            reply_markup=get_orders_keyboard(orders, 1, total_pages)
+        )
+        await callback.answer()
+    finally:
+        db.close()
+
+@router.callback_query(F.data.startswith("admin_order_"))
+async def admin_view_order(callback: CallbackQuery):
+    """View order details as admin"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized", show_alert=True)
+        return
+    
+    order_id = int(callback.data.split("_")[2])
+    
+    db = SessionLocal()
+    try:
+        order = get_order(db, order_id)
+        if not order:
+            await callback.message.edit_text("❌ Order not found.")
+            await callback.answer()
+            return
+        
+        user = get_user_by_id(db, order.user_id)
+        
+        status_emoji = get_status_emoji(order.status.value)
+        order_icon = "📱" if order.order_type.value == "activation" else "🔄"
+        
+        order_text = (
+            f"{status_emoji} <b>Order #{order.id}</b> {order_icon}\n\n"
+            f"<b>User:</b> {user.telegram_id} (@{user.username or 'No username'})\n"
+            f"<b>Type:</b> {order.order_type.value.upper()}\n"
+            f"<b>Country:</b> {order.country_name}\n"
+            f"<b>Service:</b> {order.service_name}\n"
+            f"<b>Number:</b> <code>{order.number}</code>\n"
+            f"<b>Cost:</b> {format_price(order.cost)}\n"
+            f"<b>Status:</b> {order.status.value.upper()}\n"
+            f"<b>Created:</b> {format_date(order.created_at)}\n"
+            f"<b>Expires:</b> {format_date(order.expires_at)}\n"
+        )
+        
+        if order.otp_code:
+            order_text += f"<b>OTP Code:</b> <code>{order.otp_code}</code>\n"
+        
+        order_text += f"\n<button>Actions:</b>\n"
+        order_text += f"• /refund {order.id} - Issue refund\n"
+        
+        await callback.message.edit_text(
+            order_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💰 Refund Order", callback_data=f"admin_refund_confirm_{order.id}")],
+                [InlineKeyboardButton(text="🔙 Back to Orders", callback_data="admin_orders")]
+            ])
+        )
+        await callback.answer()
+    finally:
+        db.close()
+
+@router.callback_query(F.data == "admin_refund")
+async def admin_refund_prompt(callback: CallbackQuery, state: FSMContext):
+    """Prompt for refund order ID"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_refund_order_id)
+    await callback.message.edit_text(
+        "💰 <b>Process Refund</b>\n\n"
+        "Please enter the order ID to refund:\n\n"
+        "<i>Example: 12345</i>\n"
+        "Send /cancel to abort.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="admin_panel")]
+        ])
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "admin_add_balance")
+async def admin_add_balance_prompt(callback: CallbackQuery, state: FSMContext):
+    """Prompt for add balance"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Unauthorized", show_alert=True)
+        return
+    
+    await state.set_state(AdminStates.waiting_for_add_balance_user)
+    await callback.message.edit_text(
+        "➕ <b>Add Balance</b>\n\n"
+        "Please enter the user (Telegram ID or @username):\n\n"
+        "<i>Example: 123456789 or @username</i>\n"
+        "Send /cancel to abort.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancel", callback_data="admin_panel")]
+        ])
+    )
+    await callback.answer()
+
+# Import required models
+from database.models import User, Order
 import asyncio
