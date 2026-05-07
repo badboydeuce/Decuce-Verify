@@ -1,65 +1,59 @@
 """
-Helper functions for bot notifications
+Helper functions for the bot
 """
 
-import asyncio
-import os
-from loguru import logger
+from datetime import datetime
+from typing import Optional
 
-async def send_balance_update(telegram_id: int, amount: float, new_balance: float):
-    """Send balance update notification to user"""
-    try:
-        from aiogram import Bot
-        bot = Bot(token=os.getenv('BOT_TOKEN'))
-        
-        message = (
-            f"✅ <b>Payment Received!</b>\n\n"
-            f"Amount added: <b>${amount:.2f}</b>\n"
-            f"New balance: <b>${new_balance:.2f}</b>\n\n"
-            f"Thank you for funding your wallet!"
-        )
-        
-        await bot.send_message(telegram_id, message)
-        await bot.session.close()
-        
-    except Exception as e:
-        logger.error(f"Failed to send balance update to {telegram_id}: {e}")
+def format_price(amount: float) -> str:
+    """Format price with currency symbol"""
+    return f"₦{amount:,.2f}"
 
-def send_balance_update_sync(telegram_id: int, amount: float, new_balance: float):
-    """Sync wrapper for async function"""
-    asyncio.create_task(send_balance_update(telegram_id, amount, new_balance))
+def format_date(date: datetime) -> str:
+    """Format datetime for display"""
+    return date.strftime("%Y-%m-%d %H:%M:%S")
 
-async def send_payment_failed_notification(telegram_id: int, method: str):
-    """Send payment failed notification"""
-    try:
-        from aiogram import Bot
-        bot = Bot(token=os.getenv('BOT_TOKEN'))
-        
-        message = (
-            f"❌ <b>Payment Failed</b>\n\n"
-            f"Payment method: {method}\n\n"
-            f"Please try again or contact support."
-        )
-        
-        await bot.send_message(telegram_id, message)
-        await bot.session.close()
-        
-    except Exception as e:
-        logger.error(f"Failed to send payment failed notification: {e}")
-
-async def notify_admin(message: str):
-    """Send notification to all admins"""
-    admin_ids = os.getenv('ADMIN_IDS', '').split(',')
+def format_countdown(expires_at: datetime) -> str:
+    """Format countdown timer"""
+    remaining = expires_at - datetime.utcnow()
+    if remaining.total_seconds() <= 0:
+        return "Expired"
     
+    minutes = int(remaining.total_seconds() // 60)
+    seconds = int(remaining.total_seconds() % 60)
+    return f"{minutes}m {seconds}s"
+
+def validate_amount(amount: str, min_amount: float = 1500) -> Optional[float]:
+    """Validate amount input"""
     try:
-        from aiogram import Bot
-        bot = Bot(token=os.getenv('BOT_TOKEN'))
-        
-        for admin_id in admin_ids:
-            if admin_id.strip():
-                await bot.send_message(int(admin_id), f"🔔 <b>Admin Alert</b>\n\n{message}")
-        
-        await bot.session.close()
-        
-    except Exception as e:
-        logger.error(f"Failed to send admin notification: {e}")
+        amount_float = float(amount)
+        if amount_float < min_amount:
+            return None
+        return amount_float
+    except ValueError:
+        return None
+
+def mask_phone_number(number: str) -> str:
+    """Mask phone number for display"""
+    if len(number) <= 8:
+        return number
+    return f"{number[:4]}***{number[-4:]}"
+
+def get_otp_from_sms(text: str) -> Optional[str]:
+    """Extract OTP code from SMS text"""
+    import re
+    
+    # Common OTP patterns
+    patterns = [
+        r'\b\d{4,8}\b',  # 4-8 digit numbers
+        r'code[:\s]*(\d{4,8})',  # code: 1234
+        r'OTP[:\s]*(\d{4,8})',  # OTP: 1234
+        r'verification[:\s]*(\d{4,8})',  # verification: 1234
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1) if match.lastindex else match.group(0)
+    
+    return None
