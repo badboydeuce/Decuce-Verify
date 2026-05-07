@@ -82,5 +82,18 @@ async def main():
         logger.error(f"❌ Bot failed to start: {e}")
         raise
 
+def run_bot():
+    """Run the bot in a separate thread with its own event loop"""
+    try:
+        # Create new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Run the bot
+        loop.run_until_complete(main())
+        loop.close()
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
+
 if __name__ == "__main__":
     asyncio.run(main())
