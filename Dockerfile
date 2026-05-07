@@ -6,6 +6,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     libpq-dev \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first
@@ -16,11 +17,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy project files
 COPY . .
 
-# Make start script executable
-RUN chmod +x start.sh
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:5000/health || exit 1
 
 # Expose port
 EXPOSE 5000
 
-# Run both services
-CMD ["/bin/bash", "start.sh"]
+# Run the API
+CMD ["python", "api/app.py"]
