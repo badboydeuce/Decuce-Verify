@@ -1,6 +1,7 @@
 """
 DeuceVerify - Main Flask API Application
-Handles webhooks, payment processing, and serves as the main application entry point
+Handles webhooks, payment processing, and serves as the main API endpoint
+Bot runs as a separate process - DO NOT run bot inside this file
 """
 
 from flask import Flask, request, jsonify
@@ -9,7 +10,6 @@ import logging
 import os
 import sys
 from datetime import datetime
-import multiprocessing
 import requests
 import json
 
@@ -27,7 +27,8 @@ from database.crud import (
     get_or_create_user,
     get_user_orders,
     get_order,
-    update_order_otp
+    update_order_otp,
+    get_user_transactions
 )
 from api.services.paystack import paystack
 
@@ -51,6 +52,12 @@ with app.app_context():
         logger.info("✅ Database initialized successfully")
     except Exception as e:
         logger.error(f"❌ Database initialization failed: {e}")
+
+# ============ HELPER FUNCTIONS ============
+
+def format_amount(amount: float) -> str:
+    """Format amount for display"""
+    return f"₦{amount:,.2f}"
 
 # ============ HEALTH CHECK ENDPOINTS ============
 
@@ -159,33 +166,6 @@ def paystack_webhook():
             payment_tx = update_payment_transaction(db, reference, "completed", event_data)
             
             logger.info(f"✅ Successfully credited ₦{amount} to user {telegram_id}. New balance: ₦{user.balance}")
-            
-            # Try to notify user via bot (async but we'll do best effort)
-            try:
-                import threading
-                import asyncio
-                
-                def notify_user():
-                    try:
-                        from bot.main import bot
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        loop.run_until_complete(
-                            bot.send_message(
-                                telegram_id,
-                                f"💰 <b>Payment Successful!</b>\n\n"
-                                f"Your wallet has been credited with {format_amount(amount)}.\n\n"
-                                f"<b>New Balance:</b> {format_amount(user.balance)}\n\n"
-                                f"Thank you for funding your wallet!",
-                                parse_mode="HTML"
-                            )
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to send notification: {e}")
-                
-                threading.Thread(target=notify_user, daemon=True).start()
-            except Exception as e:
-                logger.error(f"Error sending notification: {e}")
             
             return jsonify({
                 "status": "success",
@@ -329,7 +309,6 @@ def get_transactions():
         if not user:
             return jsonify({"error": "User not found"}), 404
         
-        from database.crud import get_user_transactions
         transactions = get_user_transactions(db, user.id, limit, offset)
         
         return jsonify({
@@ -512,6 +491,7 @@ def cancel_order(order_id):
             return jsonify({"error": "Order not found or cannot be cancelled"}), 404
         
         # If no OTP received and within timeout, refund
+        refund_issued = False
         if not order.otp_code and order.status.value == "cancelled":
             update_user_balance(db, user.id, order.cost, "credit")
             create_transaction(
@@ -521,11 +501,12 @@ def cancel_order(order_id):
                 transaction_type="credit",
                 description=f"Refund for cancelled order #{order_id}"
             )
+            refund_issued = True
         
         return jsonify({
             "status": "success",
             "message": f"Order #{order_id} cancelled successfully",
-            "refund_issued": not order.otp_code
+            "refund_issued": refund_issued
         }), 200
     except Exception as e:
         logger.error(f"Error cancelling order: {e}")
@@ -575,7 +556,7 @@ def admin_users():
     
     db = SessionLocal()
     try:
-        from database.crud import get_all_users
+        from database.crud import get_all_users, get_user_count
         users = get_all_users(db, limit, offset)
         total = get_user_count(db)
         
@@ -627,39 +608,6 @@ def bad_request(error):
         "message": str(error.description) if hasattr(error, 'description') else "Invalid request"
     }), 400
 
-# ============ HELPER FUNCTIONS ============
-
-def format_amount(amount: float) -> str:
-    """Format amount for display"""
-    return f"₦{amount:,.2f}"
-
-# ============ RUN BOT IN SEPARATE PROCESS ============
-
-def run_bot_process():
-    """Run the telegram bot in a separate process"""
-    import asyncio
-    import threading
-    
-    def run_bot():
-        """Run bot in thread with its own event loop"""
-        try:
-            from bot.main import main
-            
-            # Create new event loop for this thread
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            # Run the bot
-            loop.run_until_complete(main())
-            loop.close()
-        except Exception as e:
-            logger.error(f"Failed to start bot: {e}")
-    
-    # Start bot in daemon thread
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    return bot_thread
-
 # ============ MAIN ENTRY POINT ============
 
 if __name__ == "__main__":
@@ -668,28 +616,19 @@ if __name__ == "__main__":
     print("🚀 DeuceVerify API Server Starting...")
     print("=" * 60)
     print(f"📡 Flask Port: {settings.flask_port}")
-    print(f"🤖 Bot Token: {'✅ Configured' if settings.bot_token else '❌ Missing'}")
     print(f"💳 Paystack: {'✅ Configured' if settings.paystack_secret_key else '❌ Missing'}")
     print(f"📱 SMS-Man: {'✅ Configured' if settings.sms_man_token else '❌ Missing'}")
     print(f"💾 Database: {'✅ Configured' if settings.database_url else '❌ Missing'}")
     print(f"💰 Min Funding: ₦{settings.minimum_funding_ngn}")
     print(f"📈 Profit Margin: {settings.profit_margin}%")
     print("=" * 60)
+    print("⚠️  Bot must be started separately with: python run_bot.py")
+    print("=" * 60)
     
-    # Start bot in background
-    bot_thread = run_bot_process()
-    logger.info("🤖 Bot started in background thread")
-    
-    # Run Flask API
-    logger.info(f"🌐 Starting Flask API on port {settings.flask_port}")
-    try:
-        app.run(
-            host="0.0.0.0",
-            port=settings.flask_port,
-            debug=False,
-            threaded=True,
-            use_reloader=False  # Important: Prevents double-starting the bot
-        )
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-        sys.exit(0)
+    # Run Flask API only (no bot threading)
+    app.run(
+        host="0.0.0.0",
+        port=settings.flask_port,
+        debug=False,
+        threaded=True
+    )
