@@ -94,82 +94,99 @@ def db_health_check():
 @app.route('/api/webhook/paystack', methods=['POST'])
 def paystack_webhook():
     """
-    Handle Paystack webhook events
-    Expected events: charge.success, transfer.success, etc.
+    Handle Paystack webhook events with proper transaction management.
     """
     payload = request.get_data()
     signature = request.headers.get('x-paystack-signature')
     
-    logger.info(f"Received webhook from Paystack")
-    
+    logger.info("Received Paystack webhook")
+
     # Validate signature
     if not signature:
-        logger.error("No signature provided in webhook")
+        logger.error("Webhook received without signature")
         return jsonify({"error": "No signature provided"}), 400
-    
-    # Verify and process webhook
+
+    # Verify webhook
     event_data = paystack.handle_webhook(payload, signature)
     if not event_data:
-        logger.error("Invalid webhook signature")
+        logger.error("Invalid Paystack webhook signature")
         return jsonify({"error": "Invalid signature"}), 401
-    
-    # Process successful charge
-    if event_data.get("status") == "success":
-        reference = event_data.get("reference")
-        amount = event_data.get("amount", 0) / 100  # Convert from kobo to NGN
-        metadata = event_data.get("metadata", {})
-        telegram_id = metadata.get("telegram_id")
-        user_id = metadata.get("user_id")
-        
-        logger.info(f"Processing successful payment: reference={reference}, amount=₦{amount}, telegram_id={telegram_id}")
-        
-        if not telegram_id:
-            logger.error("No telegram_id in webhook metadata")
-            return jsonify({"error": "Missing telegram_id"}), 400
-        
-        db = SessionLocal()
-        try:
-            # Get user
-            user = get_user_by_telegram_id(db, telegram_id)
-            if not user:
-                logger.error(f"User not found: telegram_id={telegram_id}")
-                return jsonify({"error": "User not found"}), 404
-            
-            # Update user balance
-            user = update_user_balance(db, user.id, amount, "credit")
-            
-            # Create transaction record
-            transaction = create_transaction(
-                db=db,
-                user_id=user.id,
-                amount=amount,
-                transaction_type="credit",
-                reference=reference,
-                description=f"Wallet funding via Paystack",
-                status="completed"
-            )
-            
-            # Update payment transaction if exists
-            payment_tx = update_payment_transaction(db, reference, "completed", event_data)
-            
-            logger.info(f"✅ Successfully credited ₦{amount} to user {telegram_id}. New balance: ₦{user.balance}")
-            
-            return jsonify({
-                "status": "success",
-                "message": "Payment processed successfully",
-                "user_balance": user.balance
-            }), 200
-            
-        except Exception as e:
-            logger.error(f"Error processing webhook: {e}")
+
+    event = event_data.get('event')
+    logger.info(f"Processing webhook event: {event}")
+
+    # Only process charge.success for now (you can extend later)
+    if event != 'charge.success':
+        logger.info(f"Unhandled event type: {event}")
+        return jsonify({"status": "ignored", "event": event}), 200
+
+    # Extract payment details
+    data = event_data.get('data', {})
+    reference = data.get('reference')
+    amount_kobo = data.get('amount', 0)
+    amount = amount_kobo / 100  # Convert to Naira
+    metadata = data.get('metadata', {})
+    telegram_id = metadata.get('telegram_id')
+    user_id = metadata.get('user_id')  # fallback if needed
+
+    logger.info(f"Successful charge - Ref: {reference}, Amount: ₦{amount}, TG_ID: {telegram_id}")
+
+    if not telegram_id:
+        logger.error("Missing telegram_id in payment metadata")
+        return jsonify({"error": "Missing telegram_id in metadata"}), 400
+
+    db = SessionLocal()
+    try:
+        # Start transaction
+        db.begin()
+
+        # Get user
+        user = get_user_by_telegram_id(db, telegram_id)
+        if not user:
+            logger.error(f"User not found for telegram_id: {telegram_id}")
             db.rollback()
-            return jsonify({"error": str(e)}), 500
-        finally:
-            db.close()
-    
-    # Handle other event types
-    logger.info(f"Unhandled webhook event: {event_data.get('event')}")
-    return jsonify({"status": "ignored"}), 200
+            return jsonify({"error": "User not found"}), 404
+
+        # Update balance
+        user = update_user_balance(db, user.id, amount, "credit")
+
+        # Create transaction record
+        create_transaction(
+            db=db,
+            user_id=user.id,
+            amount=amount,
+            transaction_type="credit",
+            reference=reference,
+            description="Wallet funding via Paystack",
+            status="completed"
+        )
+
+        # Update payment transaction record
+        update_payment_transaction(db, reference, "completed", data)
+
+        # Commit all changes at once
+        db.commit()
+
+        logger.info(f"✅ Payment processed successfully | User {telegram_id} credited ₦{amount} | New balance: ₦{user.balance}")
+
+        return jsonify({
+            "status": "success",
+            "message": "Payment processed successfully",
+            "reference": reference,
+            "amount": amount,
+            "new_balance": float(user.balance)
+        }), 200
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"❌ Webhook processing failed for reference {reference}: {e}", exc_info=True)
+        return jsonify({
+            "error": "Failed to process payment",
+            "message": str(e)
+        }), 500
+
+    finally:
+        db.close()
 
 # ============ WALLET ENDPOINTS ============
 
