@@ -11,6 +11,7 @@ import sys
 from datetime import datetime
 from threading import Thread
 import asyncio
+import requests
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,9 +24,14 @@ from database.crud import (
     create_transaction,
     create_payment_transaction,
     update_payment_transaction,
-    get_user_by_id
+    get_user_by_id,
+    get_or_create_user,
+    get_user_orders,
+    get_order,
+    update_order_otp
 )
 from api.services.paystack import paystack
+from api.services.sms_man import sms_man
 
 # Configure logging
 logging.basicConfig(
@@ -68,7 +74,6 @@ def db_health_check():
     """Database health check"""
     try:
         db = SessionLocal()
-        # Try to execute a simple query
         from database.models import User
         count = db.query(User).count()
         db.close()
@@ -130,10 +135,6 @@ def paystack_webhook():
                 logger.error(f"User not found: telegram_id={telegram_id}")
                 return jsonify({"error": "User not found"}), 404
             
-            # Check if already processed (idempotency)
-            existing_tx = get_user_by_telegram_id(db, telegram_id)  # Check by reference would be better
-            # For idempotency, we should check if transaction with this reference already exists
-            
             # Update user balance
             user = update_user_balance(db, user.id, amount, "credit")
             
@@ -152,9 +153,6 @@ def paystack_webhook():
             payment_tx = update_payment_transaction(db, reference, "completed", event_data)
             
             logger.info(f"✅ Successfully credited ₦{amount} to user {telegram_id}. New balance: ₦{user.balance}")
-            
-            # TODO: Send notification to user via Telegram bot
-            # This would require accessing the bot instance
             
             return jsonify({
                 "status": "success",
@@ -240,7 +238,6 @@ def fund_wallet():
     db = SessionLocal()
     try:
         # Get or create user
-        from database.crud import get_or_create_user
         user = get_or_create_user(db, telegram_id)
         
         # Initialize Paystack transaction
@@ -337,7 +334,6 @@ def get_orders():
         if not user:
             return jsonify({"error": "User not found"}), 404
         
-        from database.crud import get_user_orders
         orders = get_user_orders(db, user.id, status)
         
         return jsonify({
@@ -362,7 +358,7 @@ def get_orders():
 
 @app.route('/api/order/<int:order_id>/otp', methods=['GET'])
 def get_order_otp(order_id):
-    """Get OTP for an order"""
+    """Get OTP for an order - Synchronous version without await"""
     telegram_id = request.args.get('telegram_id')
     
     if not telegram_id:
@@ -370,7 +366,6 @@ def get_order_otp(order_id):
     
     db = SessionLocal()
     try:
-        from database.crud import get_order
         user = get_user_by_telegram_id(db, int(telegram_id))
         if not user:
             return jsonify({"error": "User not found"}), 404
@@ -379,19 +374,19 @@ def get_order_otp(order_id):
         if not order:
             return jsonify({"error": "Order not found"}), 404
         
-        # For active orders, try to fetch latest OTP from SMS-Man
+        # For active orders, try to fetch latest OTP from SMS-Man (synchronously)
         if order.status.value in ["pending", "received"]:
-            from api.services.sms_man import sms_man
-            
-            if order.order_type.value == "activation":
-                result = await asyncio.to_thread(
-                    sms_man.get_activation_sms, 
-                    int(order.request_id)
-                )
-                if result.get("sms_code"):
-                    from database.crud import update_order_otp
-                    update_order_otp(db, order_id, result["sms_code"])
-                    order.otp_code = result["sms_code"]
+            try:
+                # Use synchronous call to SMS-Man API
+                if order.order_type.value == "activation":
+                    # This is a synchronous call - no await needed
+                    import requests
+                    result = sms_man.get_activation_sms_sync(int(order.request_id))
+                    if result and result.get("sms_code"):
+                        update_order_otp(db, order_id, result["sms_code"])
+                        order.otp_code = result["sms_code"]
+            except Exception as e:
+                logger.error(f"Error fetching OTP: {e}")
         
         return jsonify({
             "order_id": order.id,
@@ -428,7 +423,10 @@ def run_bot():
     """Run the Telegram bot in a separate thread"""
     try:
         from bot.main import main
-        asyncio.run(main())
+        # Create new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(main())
     except Exception as e:
         logger.error(f"Failed to start bot: {e}")
 
